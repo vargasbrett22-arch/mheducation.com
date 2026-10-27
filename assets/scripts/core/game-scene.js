@@ -12,7 +12,7 @@ class PracticeMode {
     return this.practiceMode;
   }
   saveCheckpoint(playerState, playerWorldX, cameraX, scene) {
-    if (!this.practiceMode) return false;
+    if (!this.practiceMode || playerState.isDead) return false;
     const checkpoint = {
       x: playerWorldX,
       y: playerState.y,
@@ -36,6 +36,7 @@ class PracticeMode {
       canJump: playerState.canJump,
       wasBoosted: playerState.wasBoosted,
       rotation: playerState.rotation,
+      rotateActionActive: !!scene?._player?.rotateActionActive,
       gravity: playerState.gravity,
       jumpPower: playerState.jumpPower,
       mirrored: playerState.mirrored,
@@ -129,23 +130,118 @@ class MacroBot {
   resetAll() {
     this.recording = false;
     this.playing = false;
-
     this.cursor = 0;
-    this.isDown = false;
-
-    this.inputs = [];
-
+    this.frames = [];
+    this.currentFrameState = null;
     this.meta = {
       author: "Web Dashers",
-      level: "", // ill fix ts later
-      version: 1
+      level: "",
+      version: 2,
     };
+  }
+
+  _cloneState(state) {
+    if (!state) return null;
+    const out = {};
+    for (const key of Object.keys(state)) {
+      const value = state[key];
+      if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        out[key] = value;
+      } else if (Array.isArray(value) && value.every(v => v === null || typeof v === "string" || typeof v === "number" || typeof v === "boolean")) {
+        out[key] = value.slice();
+      }
+    }
+    return out;
+  }
+
+  _snapshotPlayer(player, state) {
+    return {
+      state: this._cloneState(state),
+      rotation: Number.isFinite(player?._rotation) ? player._rotation : (Number.isFinite(state?.rotation) ? state.rotation : 0),
+      mode: this.scene._getDualModeId ? this.scene._getDualModeId(state) : "cube"
+    };
+  }
+
+  _captureFrame(currentFrame) {
+    const scene = this.scene;
+    return {
+      frame: currentFrame,
+      playerWorldX: scene._playerWorldX,
+      cameraX: scene._cameraX,
+      cameraY: scene._cameraY,
+      speed: playerSpeed,
+      dual: !!scene._isDual,
+      player: this._snapshotPlayer(scene._player, scene._state),
+      dualPlayer: scene._isDual ? this._snapshotPlayer(scene._player2, scene._state2) : null
+    };
+  }
+
+  _applyPlayerSnapshot(snapshot, player, state) {
+    if (!snapshot || !player || !state) return;
+
+    const mode = snapshot.mode || "cube";
+    const currentMode = this.scene._getDualModeId ? this.scene._getDualModeId(state) : "cube";
+    if (currentMode !== mode && this.scene._setPlayerGamemode) {
+      this.scene._setPlayerGamemode(player, state, mode, true);
+    }
+
+    const savedState = snapshot.state || {};
+    for (const key of Object.keys(savedState)) {
+      const value = savedState[key];
+      if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+        state[key] = value;
+      } else if (Array.isArray(value)) {
+        state[key] = value.slice();
+      }
+    }
+
+    if (Number.isFinite(snapshot.rotation)) {
+      state.rotation = snapshot.rotation;
+      player._rotation = snapshot.rotation;
+    }
+
+    if (player.setRotation && Number.isFinite(snapshot.rotation)) {
+      try { player.setRotation(snapshot.rotation); } catch (_) {}
+    }
+  }
+
+  _applyFrame(frameState) {
+    if (!frameState) return;
+    const scene = this.scene;
+
+    if (Number.isFinite(frameState.playerWorldX)) scene._playerWorldX = frameState.playerWorldX;
+    if (Number.isFinite(frameState.cameraX)) scene._cameraX = frameState.cameraX;
+    if (Number.isFinite(frameState.cameraY)) scene._cameraY = frameState.cameraY;
+    if (Number.isFinite(frameState.speed)) playerSpeed = frameState.speed;
+
+    if (frameState.player) {
+      this._applyPlayerSnapshot(frameState.player, scene._player, scene._state);
+    }
+
+    scene._isDual = !!frameState.dual;
+    if (scene._isDual && frameState.dualPlayer) {
+      this._applyPlayerSnapshot(frameState.dualPlayer, scene._player2, scene._state2);
+    }
+
+    if (!scene._isDual) {
+      scene._player2.setCubeVisible(false);
+      scene._player2.setShipVisible(false);
+      scene._player2.setBallVisible(false);
+      scene._player2.setWaveVisible(false);
+      scene._player2.setBirdVisible?.(false);
+      scene._player2.setSpiderVisible(false);
+      scene._player2.setRobotVisible(false);
+    }
   }
 
   startRecording(meta = {}) {
     this.resetAll();
     this.recording = true;
-    this.meta = { ...meta };
+    this.meta = {
+      ...this.meta,
+      ...meta,
+      version: 2
+    };
   }
 
   stopRecording() {
@@ -154,44 +250,45 @@ class MacroBot {
   }
 
   clearRecording() {
-    this.inputs = [];
+    this.frames = [];
     this.cursor = 0;
-    this.isDown = false;
+    this.currentFrameState = null;
+  }
+
+  recordFrame(currentFrame) {
+    if (!this.recording) return;
+    const frameState = this._captureFrame(currentFrame);
+    const last = this.frames[this.frames.length - 1];
+    if (last && last.frame === currentFrame) {
+      this.frames[this.frames.length - 1] = frameState;
+    } else {
+      this.frames.push(frameState);
+    }
   }
 
   rollbackRecording(currentFrame) {
-    this.inputs = this.inputs.filter(ev => (ev.frame ?? 0) <= currentFrame);
+    this.frames = this.frames.filter(frame => (frame.frame ?? 0) <= currentFrame);
     this.cursor = 0;
-    this.isDown = false;
+    this.currentFrameState = null;
   }
 
   clearPlayback() {
     this.cursor = 0;
-    this.isDown = false;
+    this.currentFrameState = null;
   }
 
   rollbackPlayback(currentFrame) {
-    if (!this.inputs.length) return;
-
+    if (!this.frames.length) return;
     this.cursor = 0;
-    this.isDown = false;
+    this.currentFrameState = null;
 
-    this.scene._releaseButton(true);
-
-    while (
-      this.cursor < this.inputs.length &&
-      (this.inputs[this.cursor].frame ?? 0) <= currentFrame
-    ) {
-      const ev = this.inputs[this.cursor++];
-
-      if (ev.down) {
-        this.scene._pushButton(true);
-        this.isDown = true;
-      } else {
-        this.scene._releaseButton(true);
-        this.isDown = false;
-      }
+    while (this.cursor < this.frames.length && (this.frames[this.cursor].frame ?? 0) <= currentFrame) {
+      this.cursor++;
     }
+
+    const index = Math.max(0, this.cursor - 1);
+    const frameState = this.frames[index];
+    if (frameState) this._applyFrame(frameState);
   }
 
   startPlayback(macroData) {
@@ -205,62 +302,52 @@ class MacroBot {
       ...(macro || {})
     };
 
-    this.inputs = Array.isArray(macro?.inputs) ? macro.inputs.slice() : [];
-    this.inputs.sort((a, b) => (a.frame ?? 0) - (b.frame ?? 0));
+    this.frames = Array.isArray(macro?.frames) ? macro.frames.slice() : [];
+    this.frames.sort((a, b) => (a.frame ?? 0) - (b.frame ?? 0));
 
     this.cursor = 0;
-    this.isDown = false;
+    this.currentFrameState = null;
+
+    if (Array.isArray(macro?.inputs) && !this.frames.length) {
+      console.warn("Outdated macro file");
+    }
   }
 
   stopPlayback() {
     this.playing = false;
     this.cursor = 0;
-    this.isDown = false;
-  }
-
-  recordEdge(down, currentFrame) {
-    if (!this.recording) return;
-
-    const last = this.inputs[this.inputs.length - 1];
-    if (last && last.down === !!down && last.frame === currentFrame) {
-      return;
-    }
-
-    this.inputs.push({
-      frame: currentFrame,
-      down: !!down
-    });
-
-    this.isDown = !!down;
+    this.currentFrameState = null;
   }
 
   step(currentFrame) {
-    if (!this.playing) return;
+    if (!this.playing || !this.frames.length) return;
 
     while (
-      this.cursor < this.inputs.length &&
-      (this.inputs[this.cursor].frame ?? 0) <= currentFrame
+      this.cursor < this.frames.length &&
+      (this.frames[this.cursor].frame ?? 0) <= currentFrame
     ) {
-      const ev = this.inputs[this.cursor++];
-
-      if (ev.down) {
-        if (!this.isDown) {
-          this.scene._pushButton(true);
-          this.isDown = true;
-        }
-      } else {
-        if (this.isDown) {
-          this.scene._releaseButton(true);
-          this.isDown = false;
-        }
-      }
+      this.currentFrameState = this.frames[this.cursor++];
     }
+
+    if (this.cursor >= this.frames.length) {
+      this.stopPlayback();
+      return; 
+    }
+
+    if (this.currentFrameState) {
+      this._applyFrame(this.currentFrameState);
+    }
+  }
+
+  applyCurrentFrame() {
+    if (!this.playing || !this.currentFrameState) return;
+    this._applyFrame(this.currentFrameState);
   }
 
   exportObject() {
     return {
       meta: this.meta,
-      inputs: this.inputs.slice()
+      frames: this.frames.slice()
     };
   }
 
@@ -268,7 +355,7 @@ class MacroBot {
     return JSON.stringify(this.exportObject(), null, pretty ? 2 : 0);
   }
 
-  download(filename = "macro.wbgdr") {
+  download(filename = "macro.wbgdr2") {
     const blob = new Blob([this.exportString(true)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -298,6 +385,85 @@ class MacroBot {
   }
 }
 
+
+const VERITY_MENU_LOOP_KEY = "veitymenuloop";
+const KEYBIND_ACTIONS = [
+  { id: "jump",             label: "Jump",           def: 32, icon: "PBtn_Jump_001.png" },
+  { id: "restart",          label: "Restart",        def: 82, icon: "GJ_replayBtn_001.png" },
+  { id: "practice",         label: "Practice",       def: 80, icon: "GJ_practiceBtn_001.png" },
+  { id: "noclip",           label: "Noclip",         def: 78, icon: "miniSkull_001.png" },
+  { id: "saveCheckpoint",   label: "Checkpoint",     def: 90, icon: "GJ_checkpointBtn_001.png" },
+  { id: "deleteCheckpoint", label: "Del Checkpoint", def: 88, icon: "GJ_removeCheckBtn_001.png" },
+  { id: "prevStartPos",     label: "Prev StartPos",  def: 81, icon: "GJ_arrow_01_001.png" },
+  { id: "nextStartPos",     label: "Next StartPos",  def: 69, icon: "GJ_arrow_01_001.png", flipX: true },
+];
+// Esc, arrows, A, D, W, L are used by menus / backup jump keys
+const KEYBIND_RESERVED = [27, 37, 38, 39, 65, 68, 76, 87];
+
+
+// Platformer collision helpers ported from the working mod.js movement system.
+// Horizontal motion is swept against solid objects after vertical collision checks,
+// preventing the player from getting wedged inside a block when hitboxes touch.
+function gdPlatIsWall(o) {
+  return !!o && o.type === "solid" && parseInt(o.objid ?? 0, 10) !== 143;
+}
+function gdPlatBox(o) {
+  const r = o.hitbox_radius;
+  if (r !== undefined && r !== null) return { l: o.x - r, r: o.x + r, lo: o.y - r, hi: o.y + r };
+  return { l: o.x - o.w / 2, r: o.x + o.w / 2, lo: o.y - o.h / 2, hi: o.y + o.h / 2 };
+}
+function gdPlatNearby(pl, x) {
+  try {
+    const layer = pl && pl._gameLayer;
+    return layer && typeof layer.getNearbySectionObjects === "function"
+      ? layer.getNearbySectionObjects(x).filter(gdPlatIsWall)
+      : [];
+  } catch (_) { return []; }
+}
+function gdPlatSpan(p) {
+  const size = p && p.isMini ? 18 : 30;
+  const fly = !!(p && (p.isFlying || p.isUfo || p.isWave));
+  const feet = fly ? 12 : 20, head = fly ? 12 : 3;
+  return { size, lo: p.y - size + (p.gravityFlipped ? head : feet), hi: p.y + size - (p.gravityFlipped ? feet : head) };
+}
+function gdPlatSweep(scene, x0, dx) {
+  if (!Number.isFinite(dx) || dx === 0) return 0;
+  const pl = scene._player;
+  const candidates = [{ pl, p: pl && pl.p }];
+  if (scene._isDual && scene._player2 && scene._player2.p && !scene._player2.p.isDead) {
+    candidates.push({ pl: scene._player2, p: scene._player2.p });
+  }
+  const spans = candidates.filter(q => q.p && !q.p.isDead).map(q => gdPlatSpan(q.p));
+  let x1 = x0 + dx;
+  for (const o of gdPlatNearby(pl, x1)) {
+    const b = gdPlatBox(o);
+    for (const span of spans) {
+      if (!(span.hi > b.lo && span.lo < b.hi)) continue;
+      if (dx > 0 && x0 + span.size <= b.l + 0.01 && x1 + span.size > b.l) {
+        x1 = Math.min(x1, b.l - span.size);
+      } else if (dx < 0 && x0 - span.size >= b.r - 0.01 && x1 - span.size < b.r) {
+        x1 = Math.max(x1, b.r + span.size);
+      }
+    }
+  }
+  return x1 - x0;
+}
+function gdPlatBonk(pl, worldX) {
+  const p = pl && pl.p;
+  if (!p || p.isFlying || p.isUfo || p.isWave || p.isSpider || p.isDead) return;
+  const flip = !!p.gravityFlipped;
+  if (flip ? p.yVelocity >= 0 : p.yVelocity <= 0) return;
+  const size = p.isMini ? 18 : 30;
+  for (const o of gdPlatNearby(pl, worldX)) {
+    const b = gdPlatBox(o);
+    if (!(worldX + size - 5 > b.l && worldX - size + 5 < b.r)) continue;
+    if (!flip && p.y + size > b.lo && p.lastY + size <= b.lo + 0.5) {
+      p.y = b.lo - size; p.yVelocity = 0;
+    } else if (flip && p.y - size < b.hi && p.lastY - size >= b.hi - 0.5) {
+      p.y = b.hi + size; p.yVelocity = 0;
+    }
+  }
+}
 class GameScene extends Phaser.Scene {
   constructor() {
     super({
@@ -305,6 +471,14 @@ class GameScene extends Phaser.Scene {
     });
   }
   create() {
+    if (this._gameHotkeyHandler) {
+      window.removeEventListener("keydown", this._gameHotkeyHandler, true);
+      this._gameHotkeyHandler = null;
+    }
+    if (this._modMenuBindCleanup) {
+      this._modMenuBindCleanup();
+      this._modMenuBindCleanup = null;
+    }
     this._bgSpeedX = 0.1;
     this._bgSpeedY = 0.1;
     this._menuCameraX = -centerX;
@@ -319,6 +493,26 @@ class GameScene extends Phaser.Scene {
       },
       _v: -centerX
     };
+    // The mod menu hotkey is saved separately from gameplay keybinds. Tab is the default.
+    this._modMenuKeyCode = parseInt(localStorage.getItem("gd_modMenuKeyCode") || "9", 10);
+    if (!Number.isInteger(this._modMenuKeyCode) || this._modMenuKeyCode <= 0) this._modMenuKeyCode = 9;
+    this._modMenuKeyListening = false;
+    this._modMenuBindCleanup = null;
+    this._modMenuOpenedByHotkey = false;
+    this._freecamActive = false;
+    this._freecamSpeed = 10; // world pixels per 60 Hz frame
+    // Plat levels automatically force platformer. The flag is set before a level starts.
+    const _currentLevelNameForPlat = String(window.currentlevel?.[1] || "");
+    const _currentLevelIdForPlat = String(window.currentlevel?.[2] || "").replace(/\D/g, "");
+    const _isPlatLevel = /plat/i.test(_currentLevelNameForPlat) || _currentLevelIdForPlat.endsWith("420");
+    const _samePlatLevelRestart = !!window._platLevelActive &&
+      String(window._platLevelDisplayName || "") === _currentLevelNameForPlat;
+    window._platLevelActive = _isPlatLevel || _samePlatLevelRestart;
+    if (!window._platLevelActive) window._platLevelDisplayName = null;
+    // Keep the reward choice on this scene instance so it survives changes to the global flag.
+    this._platLevelRewardMoon = !!window._platLevelActive;
+    this._forcePlatformer = window._platLevelActive || localStorage.getItem('geose_forcePlatformer') === 'true';
+    this._platformerMoveDir = 0;
     this._state = new PlayerState();
     this._level = new window.LevelObject(this, this._cameraXRef);
     this._levelEditor = new window.LevelEditor(this);
@@ -327,6 +521,9 @@ class GameScene extends Phaser.Scene {
     this._player = new PlayerObject(this, this._state, this._level);
     this._player._activationKey = "main";
     this._state2 = new PlayerState();
+    this._randomGamemodePortalActive = new Set();
+    this._randomGamemodePreviousWorldX = null;
+    this._randomGamemodePreviousWorldY = null;
     this._player2 = new PlayerObject(this, this._state2, this._level);
     this._player2._activationKey = "dual";
     this._player2.setInvertedColors?.(true);
@@ -421,6 +618,10 @@ class GameScene extends Phaser.Scene {
     this._resetGameplayState();
     this._totalJumps = parseInt(localStorage.getItem("gd_totalJumps") || "0", 10);
     this._totalDeaths = parseInt(localStorage.getItem("gd_totalDeaths") || "0", 10);
+    this._totalsecretcoins = parseInt(localStorage.getItem("gd_totalsecretcoins") || "30", 10);
+    window._totalsecretcoins = this._totalsecretcoins;
+    this._totalusercoins = parseInt(localStorage.getItem("gd_totalusercoins") || "0", 10);
+    window._totalusercoins = this._totalusercoins;
     window._completedLevels = parseInt(localStorage.getItem("gd_completedLevels") || "0", 10);
     this._playTime = 0;
     this._menuActive = true;
@@ -433,7 +634,16 @@ class GameScene extends Phaser.Scene {
     this._logo = this.add.image(0, 100, "GJ_WebSheet", "GJ_logo_001.png").setScrollFactor(0).setDepth(30).setScale(1.2);
     this._robLogo = this.add.image(110, 595, "GJ_WebSheet", "RobTopLogoBig_001.png").setScrollFactor(0).setDepth(30).setScale(0.525).setInteractive();
     this._makeBouncyButton(this._robLogo, 0.525, () => {
-      window.open("https://geometrydash.com", "_blank");
+      const entered = window._gdDevUnlocked
+        ? "brett67"
+        : window.prompt("Enter developer password:");
+      if (entered === "brett67") {
+        window._gdDevUnlocked = true;
+        window._gdDevMode = false;
+        window.alert("Developer mode unlocked. Press D to toggle it.");
+      } else if (entered !== null) {
+        window.alert("Incorrect password.");
+      }
     }, () => this._menuActive);
     const _socialIconDefs = [
       {frame:  "",                       url: "",                                                     angle: 0,                row: 0, col: 0 },
@@ -444,7 +654,7 @@ class GameScene extends Phaser.Scene {
       { frame: "gj_twIcon_001.png",      url: "https://x.com/rohanis0000gd",                          angle: 0, flipX: false, row: 1, col: 0 },
       { frame: "gj_ytIcon_001.png",      url: "https://www.youtube.com/@rohanis0000gd",               angle: 0,                row: 1, col: 1 },
       { frame: "gj_tiktokIcon_001.png",  url: "https://www.tiktok.com/@rohanis00000",                 angle: 0, flipX: false, row: 1, col: 2 },
-      { frame: "gj_githubIcon_001.png",  url: "https://github.com/spooky14237/web-dasher", angle: 0,                row: 1, col: 3 },
+      { frame: "gj_githubIcon_001.png",  url: "https://github.com/web-dashers/web-dashers.github.io", angle: 0,                row: 1, col: 3 },
 
       {frame:  "",                       url: "",                                                     angle: 0,                row: 2, col: 0 },
       {frame:  "",                       url: "",                                                     angle: 0,                row: 2, col: 1 },
@@ -480,26 +690,23 @@ class GameScene extends Phaser.Scene {
     return icon;
   });
 
-    this._copyrightText = this.add.text(0, 625, "© 2026 RobTop Games · geometrydash.com", {
+    this._copyrightText = this.add.text(0, 630, "© 2026 RobTop Games · geometrydash.com", {
       fontSize: "14px",
       color: "#ffffff",
       fontFamily: "Arial"
     }).setOrigin(1, 1).setScrollFactor(0).setDepth(30).setAlpha(0.3);
     this._tryMeImg = this.add.image(0, 150, "GJ_MenuBeta").setScrollFactor(0).setDepth(30).setScale(0.75);
     this._downloadBtns = [];
-    const _0x4fc67f = [{
-      key: "downloadSteam_001",
-      url: "https://github.com/web-dashers/web-dashers.github.io"
-    },
+    const _0x4fc67f = [
     {
-      key: "downloadApple_001",
-      url: "https://discord.gg/TfEzAVWPSJ"
+      key: "GJ_moreGamesBtn_001",
+      url: "https://sites.google.com/ecsd.me/webdashers"
     }];
     for (let _0xfeaf5c = 0; _0xfeaf5c < _0x4fc67f.length; _0xfeaf5c++) {
       const _0x1ce2a6 = _0x4fc67f[_0xfeaf5c];
       const _0x6bf69f = 1 / 1.5;
-      const _0x1d293f = this.add.image(0, 0, "GJ_WebSheet", _0x1ce2a6.key + ".png").setScrollFactor(0).setDepth(30).setScale(_0x6bf69f).setInteractive();
-      this._makeBouncyButton(_0x1d293f, _0x6bf69f, () => window.open(_0x1ce2a6.url, "_blank"), () => this._menuActive);
+      const _0x1d293f = this.add.image(0, 0, "GJ_GameSheet04", _0x1ce2a6.key + ".png").setScrollFactor(0).setDepth(30).setScale(1).setInteractive();
+      this._makeBouncyButton(_0x1d293f, 1, () => window.open(_0x1ce2a6.url, "_blank"), () => this._menuActive);
       this._downloadBtns.push(_0x1d293f);
     }
     const _0x28fa5b = this.scale.isFullscreen;
@@ -538,8 +745,8 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
     this._menuNewgroundsBtn = this.add.image(centerX + 312, screenHeight - 90, "GJ_GameSheet03", "GJ_ngBtn_001.png").setScrollFactor(0).setDepth(30).setInteractive();
     this._expandHitArea(this._menuNewgroundsBtn, 1);
     this._makeBouncyButton(this._menuNewgroundsBtn, 1, () => {
-      this._buildNewgroundsPopup();
-    }, () => this._menuActive && !this._newgroundsPopup);
+      window.open("https://sites.google.com/ecsd.me/webdasherslist/home", "_blank");
+    }, () => this._menuActive);
     this._menuGlitter = this.add.particles(0, 0, "GJ_WebSheet", {
       frame: "square.png",
       speed: 0,
@@ -794,7 +1001,10 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
       const _scaleH = _diffMeta ? _diffMeta.h : 85;
       const _iconScale = Math.min(_targetH / _scaleH, _maxW / _scaleW);
 
-      const nameText = this.add.bitmapText(centerX, sh * 0.11 - 30, "bigFont", lvl.name || "Unknown", 50)
+      const _platLevelIdDigits = String(lvl.id || "").replace(/\D/g, "");
+      const _isPlatLevelEntry = /plat/i.test(String(lvl.name || "")) || _platLevelIdDigits.endsWith("420");
+      const _displayLevelName = String(lvl.name || "Unknown").replace(/plat/ig, "").replace(/\s{2,}/g, " ").trim() || "Unknown";
+      const nameText = this.add.bitmapText(centerX, sh * 0.11 - 30, "bigFont", _displayLevelName, 50)
         .setScrollFactor(0).setDepth(503).setOrigin(0.5);
       this._fitBitmapText(nameText, sw * 0.7);
       this._playOverlayObjects.push(nameText);
@@ -811,6 +1021,7 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
       this._makeBouncyButton(playBtn2, 1, async () => {
         if (playBtnLoading) return;
         playBtnLoading = true;
+        this._audio.stopMusic();
         this._audio.playEffect("playSound_01", { volume: 1 });
         playBtn2.setTint(0x666666);
         playBtn2.disableInteractive();
@@ -1102,7 +1313,12 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
 
         window._onlineLevelId    = "online_" + lvl.id;
         window._onlineLevelString = levelString;
-        window._onlineLevelName   = lvl.name || "Online Level";
+        const _platIdDigits = String(lvl.id).replace(/\D/g, "");
+        const _isPlatLevel = /plat/i.test(String(lvl.name || "")) || _platIdDigits.endsWith("420");
+        window._platLevelActive = _isPlatLevel;
+        window._platLevelRewardMoon = _isPlatLevel;
+        window._onlineLevelName = String(lvl.name || "Online Level").replace(/plat/ig, "").replace(/\s{2,}/g, " ").trim() || "Online Level";
+        window._platLevelDisplayName = window._onlineLevelName;
         window._onlineSongOffset  = offset;
         window._onlineSongBuffer  = null;
         window._onlineSongKey     = null;
@@ -2363,7 +2579,7 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
       gfx.fillStyle(extraPanelColor, panelAlpha);
       gfx.fillRoundedRect(panelLeft, extraPanelY, panelW, extraPanelH, panelRadius);
 
-      const extraComingSoon = this.add.bitmapText(sw / 2, extraPanelY + extraPanelH / 2, "bigFont", "Coming Soon!", 42)
+      const extraComingSoon = this.add.bitmapText(sw / 2, extraPanelY + extraPanelH / 2, "bigFont", "Boi Wait!", 42)
         .setScrollFactor(0).setDepth(105).setOrigin(0.5, 0.5).setTint(0xadd8e6).setAlpha(0.75);
 
       this._searchOverlayObjects.push(gfx, qsLabel, filtersLabel, cornerBR, cornerBL,
@@ -2568,10 +2784,10 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
       this._openCreatorMenu();
     }, () => this._menuActive && !this._levelSelectOverlay);
       //icon stufff
-    this._iconBtn = this.add.image(0, 0, "GJ_GameSheet03", "GJ_garageBtn_001.png").setScrollFactor(0).setDepth(30).setInteractive().setScale(1).setTint(0x666666);
-	this._iconBtnSelected = false;
+    this._iconBtn = this.add.image(0, 0, "GJ_GameSheet03", "GJ_garageBtn_001.png").setScrollFactor(0).setDepth(30).setInteractive().setScale(1);
+    this._iconBtnSelected = false;
     this._makeBouncyButton(this._iconBtn, 1, () => {
-      
+      this._openIconSelector();
     }, () => this._menuActive && !this._levelSelectOverlay);
 
     this._iconOverlay = null;
@@ -3573,15 +3789,36 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
 
     this._startPosIndex = -1;
 
-    this.input.keyboard.on('keydown-Q', () => {
+    this._prevStartPosKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.Q);
+    this._prevStartPosKey.on("down", () => {
       if (!window.startPosSwitcher) return;
       this.changeStartPos(-1);
     });
-
-    this.input.keyboard.on('keydown-E', () => {
+    this._nextStartPosKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.E);
+    this._nextStartPosKey.on("down", () => {
       if (!window.startPosSwitcher) return;
       this.changeStartPos(1);
     });
+    this._noclipKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.N);
+    this._noclipKey.on("down", () => {
+      window.noClip = !window.noClip;
+    });
+
+    const _adjustSpeedHack = (delta) => {
+      const current = window.speedHack || 1;
+      let next = Math.round((current + delta) * 1000) / 1000;
+      next = Math.min(300, Math.max(0.001, next));
+      window.speedHack = next;
+      this._syncMusicRateToSpeed();
+    };
+    this.input.keyboard.on('keydown-Z', () => {
+      window.speedHack = 1.093939;
+      this._syncMusicRateToSpeed();
+    });
+    this.input.keyboard.on('keydown-PLUS', () => _adjustSpeedHack(0.25));
+    this.input.keyboard.on('keydown-NUMPAD_ADD', () => _adjustSpeedHack(0.25));
+    this.input.keyboard.on('keydown-MINUS', () => _adjustSpeedHack(-0.25));
+    this.input.keyboard.on('keydown-NUMPAD_SUBTRACT', () => _adjustSpeedHack(-0.25));
 
     this._percentageLabel = this.add.bitmapText(screenWidth / 2, 20, "bigFont", "0%", 30).setOrigin(0.5, 0.5);
     this._percentageLabel.setVisible(false);
@@ -3591,6 +3828,13 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
       .setOrigin(0, 0)
       .setAlpha(0.4)
       .setDepth(100)
+      .setVisible(false);
+
+    this._freecamIndicator = this.add.bitmapText(10, 90, "bigFont", "FREECAM (LEFT / RIGHT)", 20)
+      .setOrigin(0, 0)
+      .setAlpha(0.8)
+      .setDepth(100)
+      .setTint(0x66ffff)
       .setVisible(false);
 
     this._accuracyIndicator = this.add.bitmapText(10, 30, "bigFont", "100.00%", 20)
@@ -3679,6 +3923,10 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
         this._closeCreatorMenu();
         return;
       }
+      if (this._keybindPopup) {
+        this._closeKeybindPopup();
+        return;
+      }
       if (this._settingsPopup) {
         this._settingsPopup.destroy();
         this._settingsPopup = null;
@@ -3737,10 +3985,73 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
       if (this._paused) {
         this._audio.playEffect("quitSound_01");
         this._audio.stopMusic();
+        if (this._isMainLevelForCoinDisplay()) {
+          window._mainLevelReturnToSelect = true;
+        }
         this._resumeGame();
         this.scene.restart();
       } else if (!this._menuActive && !this._slideIn && !this._levelWon) {
         this._pauseGame();
+      }
+    });
+    // Tab (by default) toggles the Mod menu. F toggles Freecam; arrows pan the camera while active.
+    this._gameHotkeyHandler = (event) => {
+      if (this._modMenuKeyListening || this._keybindPopup || window._activeCustomInput) return;
+      if (event.repeat) return;
+      const code = event.keyCode || event.which;
+      if (code === 68 && window._gdDevUnlocked) { // D = Developer mode
+        event.preventDefault();
+        event.stopPropagation();
+        window._gdDevMode = !window._gdDevMode;
+        if (window._gdDevMode) {
+          const rawAttempts = window.prompt("Developer mode: set attempts (1–1,000,000):", String(this._levelAttempts || 1));
+          if (rawAttempts !== null) {
+            const requested = Math.floor(Number(rawAttempts));
+            if (Number.isFinite(requested) && requested >= 1) {
+              this._levelAttempts = Math.min(1000000, requested);
+              this._attemptsLabel?.setText("Attempt " + this._levelAttempts);
+              this._positionAttemptsLabel?.();
+            } else {
+              window.alert("Enter a number from 1 to 1,000,000.");
+            }
+          }
+        }
+        return;
+      }
+      if (code === 70) { // F = Freecam
+        if (this._menuActive || this._slideIn || this._levelWon || this._paused) return;
+        event.preventDefault();
+        event.stopPropagation();
+        this._freecamActive = !this._freecamActive;
+        this._freecamIndicator?.setVisible(this._freecamActive);
+        return;
+      }
+      if (code === this._modMenuKeyCode) {
+        event.preventDefault();
+        event.stopPropagation();
+        if (this._settingsPopup) {
+          const resumeAfterClose = !!this._modMenuOpenedByHotkey;
+          this._modMenuOpenedByHotkey = false;
+          this._settingsPopup.destroy();
+          this._settingsPopup = null;
+          if (resumeAfterClose && this._paused) this._resumeGame();
+        } else {
+          // Match the pause-menu behavior when the hotkey is used during active gameplay.
+          this._modMenuOpenedByHotkey = !this._menuActive && !this._slideIn && !this._levelWon && !this._paused;
+          if (this._modMenuOpenedByHotkey) this._pauseGame();
+          this._buildSettingsPopup();
+        }
+      }
+    };
+    window.addEventListener("keydown", this._gameHotkeyHandler, true);
+    this.events.once("shutdown", () => {
+      if (this._gameHotkeyHandler) {
+        window.removeEventListener("keydown", this._gameHotkeyHandler, true);
+        this._gameHotkeyHandler = null;
+      }
+      if (this._modMenuBindCleanup) {
+        this._modMenuBindCleanup();
+        this._modMenuBindCleanup = null;
       }
     });
     this._restartKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.R);
@@ -3760,6 +4071,8 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
           this._practiceModeBarContainer.setVisible(isPracticeMode);
         }
         this._audio.startMusic(this._getCurrentMusicSyncOffset());
+        this._syncMusicRateToSpeed();
+        setTimeout(() => this._syncMusicRateToSpeed(), 50);
       }
     });
     this._saveCheckpointKey = this.input.keyboard.addKey(Phaser.Input.Keyboard.KeyCodes.Z);
@@ -3804,6 +4117,7 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
     this._buildHUD();
     this._createStartPosGui();
     this._loadSettings();
+    this._applyKeybinds();
 
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
@@ -3847,6 +4161,7 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
     };
     this._makeBouncyButton(this._leftBtn, 1, () => {window.leftbuttoncallback()}, () => this._menuActive);
     this._makeBouncyButton(this._rightBtn, 1, () => {window.rightbuttoncallback()}, () => this._menuActive);
+    window.verityMenuLoop = localStorage.getItem("verityMenuLoop") === "true";
     const menuMusicEnabled = localStorage.getItem("menuMusicEnabled");
     const shouldPlayMenuMusic = menuMusicEnabled === null ? true : menuMusicEnabled === "true";
     
@@ -3856,10 +4171,6 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
       this._audio.startMenuMusic();
     } else if (this._audio.isplaying() && !shouldPlayMenuMusic) {
       this._audio.stopMusic();
-    }
-    if (!window.updateLogShown) {
-      this._buildUpdateLogPopup();
-      window.updateLogShown = true;
     }
     if (window.levelID) {
         this._openSearchMenu();
@@ -3927,6 +4238,9 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
       window._onlineReturnToPlayMenu = null;
       window._selectedLevelData = lvl;
       this._openPlayMenu(backTarget);
+    } else if (window._mainLevelReturnToSelect) {
+      window._mainLevelReturnToSelect = false;
+      this._openLevelSelect();
     }
   }
   _parseLevelColors(levelId) {
@@ -3970,6 +4284,12 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
       }
     };
     const isEveryEnd = (levelId) => levelId === "level_99";
+    const levelCoinRequirements = {
+      "level_14": 10,
+      "level_18": 20,
+      "level_20": 30
+    };
+    const getLevelCoinRequirement = (levelId) => levelCoinRequirements[levelId] || 0;
     const fadeIn = this.add.graphics().setScrollFactor(0).setDepth(200);
     fadeIn.fillStyle(0x000000, 1);
     fadeIn.fillRect(0, 0, sw, sh);
@@ -4039,6 +4359,10 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
         this._closeLevelSelect();
       }
     });
+
+    const downloadsoundtrack = this.add.bitmapText(cx, 585, "bigFont", "Download the soundtracks", 56).setScrollFactor(0).setDepth(155).setOrigin(0.5, 0.5).setScale(0.52).setInteractive();
+        this._makeBouncyButton(downloadsoundtrack, 0.52, () => { this._buildsongspopup(1); }); 
+
     const arrowL = this.add.image(55, cy - 25, "GJ_GameSheet03", "navArrowBtn_001.png").setScrollFactor(0).setDepth(154).setScale(1.1).setFlipX(true).setInteractive();
     const arrowR = this.add.image(sw - 55, cy - 25, "GJ_GameSheet03", "navArrowBtn_001.png").setScrollFactor(0).setDepth(154).setScale(1.1).setFlipX(false).setInteractive();
     const allLevels = window.allLevels || [];
@@ -4058,9 +4382,10 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
       }
     };
     applyCurrentPage();
-    const dotY = sh - 36;
+    const dotY = sh - 20;
+    
     const maxDots = Math.min(pageCount, 28);
-    const dotSpacing = 27;
+    const dotSpacing = 29;
     const dotStartX = cx - (maxDots - 1) * dotSpacing / 2;
     const dotObjs = [];
     const refreshDots = () => {
@@ -4076,7 +4401,7 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
     };
     refreshDots();
     const cardW = Math.min(700, sw - 180);
-    const cardH = 180;
+    const cardH = 185;
     const cardX = cx;
     const cardY = cy - 100;
     const cardSlideContainer = this.add.container(0, 0).setScrollFactor(0).setDepth(152);
@@ -4130,6 +4455,8 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
     cardHit.on("pointerdown", (ptr) => {
       onDragStart(ptr);
       if (isComingSoonPage()) return;
+      const levelId = window.currentlevel?.[2];
+      if (getLevelCoinRequirement(levelId) > (Number(window._totalsecretcoins) || 0)) return;
       this.tweens.killTweensOf(cardBounceContainer, "scale");
       this.tweens.add({ targets: cardBounceContainer, scale: 1.26, duration: 300, ease: "Bounce.Out" });
     });
@@ -4190,6 +4517,12 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
             if (isComingSoonPage()) {
               return;
             }
+
+            const requiredCoins = getLevelCoinRequirement(window.currentlevel?.[2]);
+            const collectedCoins = Number(window._totalsecretcoins) || 0;
+            if (requiredCoins > collectedCoins) {
+              return;
+            }
             
             this.input.enabled = false;
             this.tweens.killTweensOf(cardBounceContainer, "scale");
@@ -4248,8 +4581,11 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
       }
       const lvl = window.currentlevel;
       const levelId = lvl[2] || "level_1";
+      const requiredCoins = getLevelCoinRequirement(levelId);
+      const collectedCoins = Number(window._totalsecretcoins) || 0;
+      const levellocked = requiredCoins > collectedCoins;
       const levelDifficultyMap = {
-        "level_1":         "diffIcon_05_btn_001",
+        "level_1":         "diffIcon_01_btn_001",
         "level_2":         "diffIcon_01_btn_001",
         "level_3":         "diffIcon_02_btn_001",
         "level_4":         "diffIcon_02_btn_001",
@@ -4279,49 +4615,94 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
         "level_116489424": "diffIcon_00_btn_001",
         "level_4284013": "diffIcon_06_btn_001",
         "level_56199846": "diffIcon_04_btn_001",
-        "level_23":       "diffIcon_10_btn_001"
+        "level_23":       "diffIcon_10_btn_001",
+        "level_3434":     "diffIcon_08_btn_001",
+        "level_5555":     "diffIcon_00_btn_001",
+        "level_201391":   "diffIcon_04_btn_001",
+        "level_4929838":   "gjItem_02_001.png",
       };
       const diffIconKey = levelDifficultyMap[levelId] || "diffIcon_05_btn_001";
       const diffFrame = diffIconKey + ".png";
       const iconX = cardX - cardW / 2 + 52;
-      const isHardDemon = diffIconKey === "diffIcon_06_btn_001";
-      const iconRotation = isHardDemon ? Math.PI / 2 : 0;
-      const demonIcon = this.add.image(iconX - cardX, 0, "GJ_GameSheet03", diffFrame)
-        .setScrollFactor(0).setDepth(155).setScale(1).setOrigin(0.5, 0.5);
-      cardContentObjs.push(demonIcon);
-      cardBounceContainer.add(demonIcon);
-      const maxIconH = cardH - 16;
-      const maxIconW = 80;
-      const iconFrame = this.textures.getFrame("GJ_GameSheet03", diffFrame);
-      let finalIconScale = 1;
-      if (iconFrame) {
-        const scaleForH = maxIconH / iconFrame.height;
-        let scaleForW = maxIconW / iconFrame.width;
-        finalIconScale = Math.min(1, scaleForH, scaleForW);
-        demonIcon.setScale(finalIconScale);
+      if (levellocked) {
+        const lock = this.add.image(0, -8, "GJ_GameSheet03", "GJLargeLock_001.png")
+          .setScrollFactor(0).setDepth(155).setOrigin(0.5, 0.5);
+        const lockFrame = this.textures.getFrame("GJ_GameSheet03", "GJLargeLock_001.png");
+        if (lockFrame) lock.setScale(Math.min(1, (cardH - 20) / lockFrame.height));
+        cardContentObjs.push(lock);
+        cardBounceContainer.add(lock);
+      } else {
+        const isHardDemon = diffIconKey === "diffIcon_06_btn_001";
+        const demonIcon = this.add.image(iconX - cardX, 0, "GJ_GameSheet03", diffFrame)
+          .setScrollFactor(0).setDepth(155).setScale(1).setOrigin(0.5, 0.5);
+        cardContentObjs.push(demonIcon);
+        cardBounceContainer.add(demonIcon);
+        const maxIconH = cardH - 16;
+        const maxIconW = 80;
+        const iconFrame = this.textures.getFrame("GJ_GameSheet03", diffFrame);
+        let finalIconScale = 1.115;
+        if (iconFrame) {
+          const scaleForH = maxIconH / iconFrame.height;
+          const scaleForW = maxIconW / iconFrame.width;
+          finalIconScale = Math.min(1.115, scaleForH, scaleForW);
+          demonIcon.setScale(finalIconScale);
+        }
+        const iconDisplayW = (iconFrame ? iconFrame.width : 80) * finalIconScale;
+        const iconDisplayH = (iconFrame ? iconFrame.height : 80) * finalIconScale;
+        const nameLabel = this.add.bitmapText(0, 0, "bigFont", lvl[1], 60)
+          .setScrollFactor(0).setDepth(155).setOrigin(0, 0.5);
+        const gap = 25;
+        const naturalGroupW = iconDisplayW + gap + nameLabel.width;
+        const naturalGroupH = Math.max(iconDisplayH, nameLabel.height);
+        const cardPad = 16;
+        const maxGroupW = cardW - cardPad * 2 - 100;
+        const maxGroupH = cardH - cardPad * 2;
+        const groupScale = Math.min(1, maxGroupW / naturalGroupW, maxGroupH / naturalGroupH);
+        const scaledIconW = iconDisplayW * groupScale;
+        const scaledGap = gap * groupScale;
+        const totalW = scaledIconW + scaledGap + nameLabel.width * groupScale;
+        const groupStartX = cardX - totalW / 2;
+        demonIcon.setScale(finalIconScale * groupScale);
+        demonIcon.setPosition(groupStartX + scaledIconW / 2 - cardX, 0);
+        nameLabel.setScale(groupScale);
+        nameLabel.setPosition(groupStartX + scaledIconW + scaledGap - cardX, 0);
+        cardContentObjs.push(nameLabel);
+        cardBounceContainer.add(nameLabel);
       }
-      let iconDisplayW = (iconFrame ? iconFrame.width : 80) * finalIconScale;
-      const iconDisplayH = (iconFrame ? iconFrame.height : 80) * finalIconScale;
-      const nameLabel = this.add.bitmapText(0, 0, "bigFont", lvl[1], 60)
-        .setScrollFactor(0).setDepth(155).setOrigin(0, 0.5);
-      const gap = 25;
-      const naturalGroupW = iconDisplayW + gap + nameLabel.width;
-      const naturalGroupH = Math.max(iconDisplayH, nameLabel.height);
-      const cardPad = 16;
-      const maxGroupW = cardW - cardPad * 2;
-      const maxGroupH = cardH - cardPad * 2;
-      const groupScale = Math.min(1, maxGroupW / naturalGroupW, maxGroupH / naturalGroupH);
-      const scaledIconW  = iconDisplayW  * groupScale;
-      const scaledLabelW = nameLabel.width * groupScale;
-      const scaledGap = gap * groupScale;
-      const totalW = scaledIconW + scaledGap + scaledLabelW;
-      const groupStartX = cardX - totalW / 2;
-      demonIcon.setScale((finalIconScale * groupScale)+0.1);
-      demonIcon.setPosition(groupStartX + scaledIconW / 2 - cardX, 0);
-      nameLabel.setScale(groupScale);
-      nameLabel.setPosition(groupStartX + scaledIconW + scaledGap - cardX, 0);
-      cardContentObjs.push(nameLabel);
-      cardBounceContainer.add(nameLabel);
+
+      let collectedSecretCoins = [];
+      try {
+        const savedCoins = JSON.parse(localStorage.getItem("gd_secretCoins_" + levelId) || "[]");
+        const savedSlotsKey = "gd_secretCoins_" + levelId + "_slots";
+        const savedSlots = JSON.parse(localStorage.getItem(savedSlotsKey) || "null");
+        if (Array.isArray(savedSlots)) {
+          collectedSecretCoins = savedSlots.filter(slot => Number.isInteger(slot) && slot >= 0 && slot < 3);
+        } else if (levelId === window.currentlevel?.[2] && Array.isArray(this._level?._coinSprites)) {
+          const savedIds = new Set(Array.isArray(savedCoins) ? savedCoins.map(String) : []);
+          collectedSecretCoins = this._level._coinSprites
+            .filter(sprite => sprite?._secretCoinId !== undefined && savedIds.has(String(sprite._secretCoinId)))
+            .map(sprite => sprite._secretCoinSlot)
+            .filter(slot => Number.isInteger(slot));
+        }
+      } catch (_error) {}
+      if (levellocked) {
+        const coinCount = this.add.bitmapText(cardW / 2 - 117, 63, "bigFont", `${collectedCoins}/${requiredCoins}`, 42)
+          .setScrollFactor(0).setDepth(155).setOrigin(0.5, 0.5);
+        const coinIcon = this.add.image(cardW / 2 - 31, 63, "GJ_GameSheet03", "GJ_coinsIcon_001.png")
+          .setScrollFactor(0).setDepth(155).setOrigin(0.5);
+        cardContentObjs.push(coinCount, coinIcon);
+        cardBounceContainer.add([coinCount, coinIcon]);
+      }
+      for (let coinIndex = 0; !levellocked && coinIndex < 3; coinIndex++) {
+        const coinIcon = this.add.image(
+          cardW / 2 - 131 + coinIndex * 50,
+          63,
+          "GJ_GameSheet03",
+          collectedSecretCoins.includes(coinIndex) ? "GJ_coinsIcon_001.png" : "GJ_coinsIcon_gray_001.png"
+        ).setScrollFactor(0).setDepth(155).setOrigin(0.5);
+        cardContentObjs.push(coinIcon);
+        cardBounceContainer.add(coinIcon);
+      }
     };
     const barAreaY = cardY + cardH / 2 + 100;
     const barW2 = Math.min(600, sw - 200);
@@ -4466,7 +4847,7 @@ this._menuUpdateLogBtn = this.add.image(screenWidth - 30 - 50, 33, "GJ_WebSheet"
     const inputBlocker = this.add.zone(cx, cy, sw, sh)
       .setScrollFactor(0).setDepth(151).setInteractive();
     inputBlocker.on("pointerdown", onDragStart);
-    this._levelSelectStaticObjs = [overlay, inputBlocker, tableBottom, ...staticGroundTiles, ...staticGround2Tiles, staticFloorLine, cornerBL, cornerBR, backBtn, infoBtn, arrowL, arrowR, cardSlideContainer, cardHit];
+    this._levelSelectStaticObjs = [overlay, inputBlocker, tableBottom, ...staticGroundTiles, ...staticGround2Tiles, staticFloorLine, cornerBL, cornerBR, backBtn, infoBtn, arrowL, arrowR, cardSlideContainer, cardHit, downloadsoundtrack];
     this._levelSelectSwitchLevel = switchLevel;
     this._levelSelectDotObjs = dotObjs;
     this._levelSelectCardContent = cardContentObjs;
@@ -4757,6 +5138,15 @@ _buildPauseOverlay() {
     this._pauseContainer.add(this._macroBtn);
     this._makeBouncyButton(this._macroBtn, 0.4, () => this._buildMacroPopup());
 
+    this._keybindBtn = this.add.image(textureY + _0x4eb71b / 2 - 60, 225, "GJ_GameSheet03", "GJ_plainBtn_001.png").setScale(0.64).setInteractive();
+    this._keybindBtnIcon = this.add.image(this._keybindBtn.x, this._keybindBtn.y, "GJ_GameSheet03", "controllerBtn_A_001.png").setScale(0.55);
+    this._pauseContainer.add([this._keybindBtn, this._keybindBtnIcon]);
+    this._keybindBtn.setVisible(!!window.customKeybinds);
+    this._keybindBtnIcon.setVisible(!!window.customKeybinds);
+    this._makeCompositeBouncyButton(this._keybindBtn, [this._keybindBtn, this._keybindBtnIcon], 0.64, () => {
+      if (window.customKeybinds) this._buildKeybindPopup();
+    });
+
     this._pauseContainer.add(this.add.bitmapText(textureY, 65, "bigFont", window.currentlevel[1], 40).setOrigin(0.5, 0.5));
 
     const _0x21dacf = 170;
@@ -4793,6 +5183,9 @@ _buildPauseOverlay() {
         { frame: "GJ_menuBtn_001.png", atlas: "GJ_WebSheet", action: () => {
             this._audio.playEffect("quitSound_01");
             this._queueGameplayLevelViewReturn();
+            if (this._isMainLevelForCoinDisplay()) {
+              window._mainLevelReturnToSelect = true;
+            }
             this.game.registry.remove("autoStartGame");
             window.isEditor = false;
             this._audio.stopMusic();
@@ -4856,6 +5249,11 @@ _buildPauseOverlay() {
         });
     };
 
+    createSlider(textureY - 200, "gj_songIcon_001.png", this._audio.getUserMusicVolume(), v => this._audio.setUserMusicVolume(v));
+    createSlider(textureY + 200, "GJ_sfxIcon_001.png", this._sfxVolume, v => {
+        this._sfxVolume = v;
+        localStorage.setItem("userSfxVol", v);
+    });
  }
 _buildSettingsPopup() {
     if (this._settingsPopup) return;
@@ -4866,6 +5264,20 @@ _buildSettingsPopup() {
         panelHeight = 550;
 
     this._settingsPopup = this.add.container(0, 0).setScrollFactor(0).setDepth(250);
+    const _settingsPopupInstance = this._settingsPopup;
+    const _settingsPopupOriginalDestroy = _settingsPopupInstance.destroy.bind(_settingsPopupInstance);
+    _settingsPopupInstance.destroy = (...args) => {
+      if (this._modMenuBindCleanup) {
+        this._modMenuBindCleanup();
+        this._modMenuBindCleanup = null;
+      }
+      this._modMenuKeyListening = false;
+      if (this._modMenuOpenedByHotkey && this._paused) {
+        this._modMenuOpenedByHotkey = false;
+        this._resumeGame();
+      }
+      return _settingsPopupOriginalDestroy(...args);
+    };
 
     const dim = this.add.rectangle(centerX, centerY, screenWidth, screenHeight, 0, 150 / 255).setInteractive();
     this._settingsPopup.add(dim);
@@ -4884,10 +5296,24 @@ _buildSettingsPopup() {
         this._settingsPopup = null;
     });
 
-    const pages = ["Gameplay", "Visual", "Advanced", "Performance"];
+    const pages = ["Mod menu", "Visual", "Advanced", "Performance", "Controls"];
     let currentPage = 0;
     const pageTitle = this.add.bitmapText(0, -(panelHeight / 2) + 45, "bigFont", pages[currentPage], 40).setOrigin(0.5);
     innerContainer.add(pageTitle);
+    // Dedicated Jetpack section header/button using the requested RobTop sprite.
+    const jetpackSectionIcon = this.add.image(-(panelWidth / 2) + 105, -(panelHeight / 2) + 88,
+      "GJ_GameSheetIcons", "gj_jetpackBtn_on_001.png").setScale(0.55).setInteractive();
+    const jetpackSectionLabel = this.add.bitmapText(-(panelWidth / 2) + 145, -(panelHeight / 2) + 88,
+      "bigFont", "JETPACK", 25).setOrigin(0, 0.5);
+    innerContainer.add([jetpackSectionIcon, jetpackSectionLabel]);
+    this._makeBouncyButton(jetpackSectionIcon, 0.55, () => {
+      window._jetpackSectionEnabled = !window._jetpackSectionEnabled;
+      jetpackSectionLabel.setText(window._jetpackSectionEnabled ? "JETPACK: ON" : "JETPACK");
+      if (window._jetpackSectionEnabled) {
+        if (this._player && typeof this._player.enterJetpackMode === "function") this._player.enterJetpackMode();
+        else if (this._player && typeof this._player.enterBirdMode === "function") this._player.enterBirdMode();
+      }
+    });
     const leftArrow = this.add.image(-(panelWidth / 2) - 130, 0, "GJ_GameSheet03", "GJ_arrow_01_001.png")
         .setFlipX(false).setInteractive();
     innerContainer.add(leftArrow);
@@ -4940,11 +5366,15 @@ _buildSettingsPopup() {
     }
 
     var infotextstrings = {
+        "ForcePlatformer": "Turns the level into platformer-style movement. Use A/D or the arrow keys to move left and right.",
         "Enable Portal Guide": "Enables extra indicators on portals.",
         "Enable Orb Guide": "Enables extra indicators on orbs.",
+        "Rainbow Icon": "Cycles your icon's colors in every gamemode.",
+        "Random Gamemode": "Makes every gamemode portal randomly choose a gamemode.",
+        "Custom Keybinds": "Adds a button to the pause menu to rebind your keys.",
         "Practice Music Bypass": "Plays normal mode music in practice mode.",
         "Show Percentage": "Shows the percentage you are at in a level.",
-        "Percentage Decimals": "Shows decimals in level progress.",
+        "Instant Respawn": "Respawns you almost instantly after dying.",
         "Startpos Switcher": "Switches between start positions in a level.",
         "Noclip": "Allows you to phase throught mostly anything that would kill you normally.",
         "Noclip Accuracy": "Flashes your screen red when you would've died with noclip.",
@@ -4956,9 +5386,10 @@ _buildSettingsPopup() {
         "Solid Wave Trail": "Removes the extra details of the wave trail.",
         "Show CPS": "Shows when you click in a level in the top left of your screen.",
         "Show Glow": "Shows glow for basic object sets.",
-        "Use Proxy (for schools)": "Enables a proxy for a better chance to see online levels when blocked.",
-        "LDM": "Removes many effects, objects, and other things to improve performance.",
-        "Cull Distance": "Changes how many objects are shown. [DOES NOT SAVE!!]"
+        "Use Proxy (for schools)": "donest work btw not fixing it haha.",
+        "Cull Distance": "Changes how many objects are shown. [DOES NOT SAVE!!]",
+        "Default Mini Icon": "Sets player icon in min mode to default.",
+        "Safe Mode": "Enables when Noclip or Speedhack are on. Disables level Completion when enabled."
     };
 
     const createInfoButton = (container, x, y, infoTextOrKey, scale) => {
@@ -5118,6 +5549,26 @@ _buildSettingsPopup() {
     };
 
     const buildGameplayPage = (container) => {
+        createToggle(container, column2X, startY + (spacingY * 5), "Force Platformer",
+            () => !!this._forcePlatformer,
+            (v) => {
+                // Plat levels lock Force Platformer on until the level is exited.
+                if (window._platLevelActive && !v) {
+                    this._forcePlatformer = true;
+                    return;
+                }
+                this._forcePlatformer = !!v;
+                localStorage.setItem('geose_forcePlatformer', String(!!v));
+                if (this._state) {
+                    this._state.platformerFacing = this._state.platformerFacing || 1;
+                    this._state.platformerOnColliderSurface = false;
+                }
+            },
+            null,
+            25,
+            true,
+            "Force Platformer"
+        );
         createToggle(container, column1X, startY, "Show Percentage", 
             () => window.showPercentage, 
             (v) => window.showPercentage = v,
@@ -5127,13 +5578,13 @@ _buildSettingsPopup() {
             "Show Percentage"
         );
 
-        createToggle(container, column1X, startY + spacingY, "Percentage Decimals", 
+        createToggle(container, column1X, startY + spacingY, "Instant Respawn", 
             () => window.percentageDecimals, 
             (v) => window.percentageDecimals = v,
             undefined,
             undefined,
             true,
-            "Percentage Decimals"
+            "Instant Respawn"
         );
 
         createToggle(container, column1X, startY + (spacingY * 2), "StartPos Switcher", 
@@ -5179,9 +5630,9 @@ _buildSettingsPopup() {
 
         createNumberInput(container, column2X, startY, "Speedhack", 
           () => window.speedHack, 
-          (v) => window.speedHack = v,
-          0.1,
-          10,
+          (v) => { window.speedHack = v; this._syncMusicRateToSpeed(); },
+          0.001,
+          300,
           false
         );
 
@@ -5198,6 +5649,36 @@ _buildSettingsPopup() {
             20,
             true,
             "Practice Music Bypass"
+        );
+
+        createToggle(container, column2X, startY + (spacingY * 2), "Rainbow Icon",
+            () => window.rainbowIcon,
+            (v) => {
+                window.rainbowIcon = v;
+                if (!v) this._restorePlayerColors();
+            },
+            null,
+            20,
+            true,
+            "Rainbow Icon"
+        );
+
+        createToggle(container, column2X, startY + (spacingY * 3), "Random Gamemode",
+            () => window.randomGamemode,
+            (v) => window.randomGamemode = v,
+            null,
+            20,
+            true,
+            "Random Gamemode"
+        );
+
+        createToggle(container, column2X, startY + (spacingY * 4), "Custom Keybinds",
+            () => window.customKeybinds,
+            (v) => window.customKeybinds = v,
+            () => this._applyKeybinds(),
+            20,
+            true,
+            "Custom Keybinds"
         );
     };
 
@@ -5297,6 +5778,14 @@ _buildSettingsPopup() {
             true,
             "Enable Orb Guide"
         );
+          createToggle(container, column2X, startY + (spacingY * 5), "Default Mini Icon", 
+            () => window.enableMiniIcon, 
+            (v) => window.enableMiniIcon = v,
+            null, //broken script refrence???? null??? 
+            25,
+            true,
+            "Default Mini Icon"
+        );
     };
 
     const buildAdvancedPage = (container) => {
@@ -5307,19 +5796,21 @@ _buildSettingsPopup() {
             22,
             true,
             "Use Proxy (for schools)"
+        );/*
+          createToggle(container, column1X, startY + (spacingY * 1), "Safe Mode",
+            () => !window.enablesafemode,
+            (v) => { window.enablesafemode = !v; },
+            null,
+            22,
+            true,
+            "Safe Mode"
+            
         );
+        */
     };
 
         const buildPerformancePage = (container) => {
-        createToggle(container, column1X, startY, "Low Detail Mode", 
-            () => window.enableLDM, 
-            (v) => window.enableLDM = v,
-            null,
-            26,
-            true,
-            "LDM"
-        );
-        createNumberInput(container, column1X, startY + (spacingY * 1), "Cull Distance",
+        createNumberInput(container, column1X, startY, "Cull Distance",
           () => (typeof window.cullDistance !== 'undefined' ? window.cullDistance : 3),
           (v) => window.cullDistance = v,
           0,
@@ -5330,7 +5821,86 @@ _buildSettingsPopup() {
         );
     };
 
+    const _getModMenuKeyLabel = () => {
+        const code = this._modMenuKeyCode;
+        if (code >= 48 && code <= 57) return String.fromCharCode(code);
+        if (code >= 96 && code <= 105) return "NUM " + String.fromCharCode(code - 48);
+        return this._getKeyName(code);
+    };
+
+    const buildControlsPage = (container) => {
+        const title = this.add.bitmapText(-290, -125, "bigFont", "Open Mod Menu", 30).setOrigin(0, 0.5);
+        this._fitBitmapText(title, 300);
+        container.add(title);
+
+        const keyButton = this.add.nineslice(165, -125, "GJ_button01", null, 190, 52, 18, 18, 18, 18)
+          .setOrigin(0.5).setInteractive();
+        const keyText = this.add.bitmapText(165, -125, "goldFont", _getModMenuKeyLabel(), 32).setOrigin(0.5);
+        this._fitBitmapText(keyText, 170);
+        container.add([keyButton, keyText]);
+
+        const status = this.add.bitmapText(0, -35, "goldFont", "Click the key box to change the hotkey", 24).setOrigin(0.5);
+        this._fitBitmapText(status, 690);
+        container.add(status);
+
+        const freecamText = this.add.bitmapText(0, 45, "bigFont", "Freecam: press F, then use LEFT / RIGHT arrows", 25).setOrigin(0.5);
+        this._fitBitmapText(freecamText, 690);
+        container.add(freecamText);
+        const hintText = this.add.bitmapText(0, 100, "goldFont", "The hotkey is saved on this browser", 21).setOrigin(0.5);
+        container.add(hintText);
+
+        let bindingHandler = null;
+        const cleanupBinding = () => {
+          if (bindingHandler) {
+            window.removeEventListener("keydown", bindingHandler, true);
+            bindingHandler = null;
+          }
+          if (this._modMenuBindCleanup === cleanupBinding) this._modMenuBindCleanup = null;
+          this._modMenuKeyListening = false;
+          keyButton.clearTint();
+        };
+        this._makeCompositeBouncyButton(keyButton, [keyButton, { target: keyText, getBaseScaleX: () => keyText.scaleX, getBaseScaleY: () => keyText.scaleY }], 1, () => {
+          if (this._modMenuBindCleanup) this._modMenuBindCleanup();
+          this._modMenuKeyListening = true;
+          keyButton.setTint(0xffff66);
+          keyText.setText("...");
+          status.setText("Press a key (ESC cancels)");
+          bindingHandler = (event) => {
+            if (!this._modMenuKeyListening) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.repeat) return;
+            const code = event.keyCode || event.which;
+            if (code === 27) {
+              cleanupBinding();
+              keyText.setText(_getModMenuKeyLabel());
+              this._fitBitmapText(keyText, 170);
+              status.setText("Cancelled");
+              return;
+            }
+            // Keep gameplay and the F freecam key available; numbers like 9 are fine.
+            const reservedKeys = [13, 32, 37, 38, 39, 40, 65, 68, 70, 69, 76, 78, 80, 81, 82, 87, 88, 90];
+            if (reservedKeys.includes(code)) {
+              status.setText("That key is already used by gameplay");
+              return;
+            }
+            this._modMenuKeyCode = code;
+            localStorage.setItem("gd_modMenuKeyCode", String(code));
+            cleanupBinding();
+            keyText.setText(_getModMenuKeyLabel());
+            this._fitBitmapText(keyText, 170);
+            status.setText("Saved! Press " + _getModMenuKeyLabel() + " to open / close the Mod menu");
+          };
+          this._modMenuBindCleanup = cleanupBinding;
+          window.addEventListener("keydown", bindingHandler, true);
+        });
+    };
+
     const buildPage = (idx) => {
+        if (this._modMenuBindCleanup) {
+          this._modMenuBindCleanup();
+          this._modMenuBindCleanup = null;
+        }
         pageContainer.destroy();
         pageContainer = this.add.container(0, 0);
         innerContainer.add(pageContainer);
@@ -5340,6 +5910,7 @@ _buildSettingsPopup() {
         else if (idx === 1) buildVisualPage(pageContainer);
         else if (idx === 2) buildAdvancedPage(pageContainer);
         else if (idx === 3) buildPerformancePage(pageContainer);
+        else if (idx === 4) buildControlsPage(pageContainer);
     };
 
     buildPage(0);
@@ -5378,12 +5949,16 @@ _buildSettingsPopup() {
         showCPS: window.showCPS,
         speedHack: window.speedHack,
         macroBot: window.macroBot,
+        rainbowIcon: window.rainbowIcon,
+        randomGamemode: window.randomGamemode,
+        customKeybinds: !!window.customKeybinds,
         practiceMusicSync: window.practiceMusicSync,
         showGlow: window.showGlow,
         showEditorGlow: window.showEditorGlow,
         useDirectInternet: !!window.useDirectInternet,
         enablePortalGuide: window.enablePortalGuide,
         enableOrbGuide: window.enableOrbGuide,
+        enableMiniIcon: window.enableMiniIcon,
         cullDistance: window.cullDistance,
         settingInfoText: window.settingInfoText || {},
         enableLDM: window.enableLDM,
@@ -5400,7 +5975,7 @@ _buildSettingsPopup() {
         showHitboxes: false,
         startPosSwitcher: false,
         hitboxTrail: false,
-        showFPS: false,
+        showFPS: true,
         solidWaveTrail: false,
         noclipAccuracy: false,
         hitboxesOnDeath: false,
@@ -5409,12 +5984,16 @@ _buildSettingsPopup() {
         showCPS: false,
         speedHack: 1.0,
         macroBot: false,
-        practiceMusicSync: false,
+        rainbowIcon: false,
+        randomGamemode: false,
+        customKeybinds: false,
+        practiceMusicSync: true,
         showGlow: true,
         showEditorGlow: false,
         useDirectInternet: true,
         enablePortalGuide: true,
         enableOrbGuide: false,
+        enableMiniIcon: false,
         enableLDM: false,
         cullDistance: 3
     };
@@ -5434,6 +6013,11 @@ _buildSettingsPopup() {
     window.showCPS = data.showCPS;
     window.speedHack = data.speedHack;
     window.macroBot = data.macroBot;
+    window.rainbowIcon = !!data.rainbowIcon;
+    window.randomGamemode = data.randomGamemode !== false;
+    window.customKeybinds = !!data.customKeybinds;
+    try { window.keybinds = JSON.parse(localStorage.getItem("gd_keybinds") || "{}"); }
+    catch (e) { window.keybinds = {}; }
     window.practiceMusicSync = !!data.practiceMusicSync;
     window.showGlow = data.showGlow;
     window.showEditorGlow = data.showEditorGlow;
@@ -5441,11 +6025,229 @@ _buildSettingsPopup() {
     window.showObjectIds = data.showObjectIds;
     window.enablePortalGuide = data.enablePortalGuide;
     window.enableOrbGuide = data.enableOrbGuide;
+    window.enableMiniIcon = data.enableMiniIcon;
     window.cullDistance = typeof data.cullDistance !== 'undefined' ? data.cullDistance : 3;
     window.settingInfoText = data.settingInfoText || {};
     window.useDirectInternet = !!data.useDirectInternet;
     localStorage.setItem("gd_useDirectInternet", String(!!window.useDirectInternet));
     window.enableLDM = !!data.enableLDM;
+  }
+  _getKeybind(id) {
+    const act = KEYBIND_ACTIONS.find(a => a.id === id);
+    const v = window.keybinds && window.keybinds[id];
+    return Number.isInteger(v) ? v : act.def;
+  }
+  _saveKeybinds() {
+    localStorage.setItem("gd_keybinds", JSON.stringify(window.keybinds || {}));
+  }
+  _getKeyName(code) {
+    if (!this._keyNameMap) {
+      const map = {};
+      for (const [name, c] of Object.entries(Phaser.Input.Keyboard.KeyCodes)) {
+        if (map[c] === undefined) map[c] = name;
+      }
+      this._keyNameMap = map;
+    }
+    return String(this._keyNameMap[code] ?? ("KEY " + code)).replace(/_/g, " ");
+  }
+  _getKeybindObjects() {
+    return {
+      jump: this._spaceKey,
+      restart: this._restartKey,
+      practice: this._practiceKey,
+      noclip: this._noclipKey,
+      saveCheckpoint: this._saveCheckpointKey,
+      deleteCheckpoint: this._deleteCheckpointKey,
+      prevStartPos: this._prevStartPosKey,
+      nextStartPos: this._nextStartPosKey,
+    };
+  }
+  _applyKeybinds() {
+    const kb = this.input?.keyboard;
+    if (!kb) return;
+    const objs = this._getKeybindObjects();
+    const enabled = !!window.customKeybinds;
+    for (const act of KEYBIND_ACTIONS) {
+      const k = objs[act.id];
+      if (k && kb.keys[k.keyCode] === k) delete kb.keys[k.keyCode];
+    }
+    for (const act of KEYBIND_ACTIONS) {
+      const k = objs[act.id];
+      if (!k) continue;
+      const code = enabled ? this._getKeybind(act.id) : act.def;
+      k.keyCode = code;
+      k.reset();
+      kb.keys[code] = k;
+      kb.addCapture(code);
+    }
+  }
+  _buildKeybindPopup() {
+    if (this._keybindPopup) return;
+    const centerX = screenWidth / 2, centerY = 320, panelWidth = 800, panelHeight = 540;
+
+    this._keybindPopup = this.add.container(0, 0).setScrollFactor(0).setDepth(250);
+    const dim = this.add.rectangle(centerX, centerY, screenWidth, screenHeight, 0x000000, 150 / 255).setInteractive();
+    this._keybindPopup.add(dim);
+
+    const inner = this.add.container(centerX, centerY).setScale(0);
+    this._keybindPopup.add(inner);
+
+    const corner = 0.325 * this.textures.get("GJ_square01").source[0].width;
+    inner.add(this._drawScale9(0, 0, panelWidth, panelHeight, "GJ_square01", corner, 0xffffff, 1));
+
+    const closeBtn = this.add.image(-(panelWidth / 2) + 10, -(panelHeight / 2) + 10, "GJ_WebSheet", "GJ_closeBtn_001.png").setScale(0.8).setInteractive();
+    inner.add(closeBtn);
+    this._makeBouncyButton(closeBtn, 0.8, () => this._closeKeybindPopup());
+
+    // title + controller decorations
+    const title = this.add.bitmapText(0, -(panelHeight / 2) + 45, "bigFont", "Keybinds", 44).setOrigin(0.5);
+    inner.add(title);
+    const decorX = title.width / 2 + 45;
+    inner.add(this.add.image(-decorX, title.y, "GJ_GameSheet03", "controllerBtn_A_001.png").setScale(0.9));
+    inner.add(this.add.image(decorX, title.y, "GJ_GameSheet03", "controllerBtn_B_001.png").setScale(0.9));
+
+    const status = this.add.bitmapText(0, 205, "goldFont", "Click a box, then press a key", 24).setOrigin(0.5);
+    inner.add(status);
+
+    const cells = {};
+    let listening = null;
+
+    const setKeyLabel = (txt, str) => {
+      txt.setText(str);
+      this._fitBitmapText(txt, 170);
+      txt._kbScale = txt.scaleX;
+    };
+    const refreshCell = (id) => {
+      const c = cells[id];
+      if (!c) return;
+      c.btn.clearTint();
+      setKeyLabel(c.txt, this._getKeyName(this._getKeybind(id)));
+    };
+    const refreshAll = () => KEYBIND_ACTIONS.forEach(a => refreshCell(a.id));
+    const stopListening = (msg) => {
+      if (listening) {
+        const prev = listening;
+        listening = null;
+        refreshCell(prev);
+      }
+      status.setText(msg || "Click a box, then press a key");
+    };
+    const startListening = (id) => {
+      if (listening) stopListening();
+      listening = id;
+      cells[id].btn.setTint(0xffff66);
+      setKeyLabel(cells[id].txt, "...");
+      status.setText("Press a key, ESC to cancel");
+    };
+
+    const cols = [-200, 200];
+    const rowStartY = -125, rowGap = 90;
+    KEYBIND_ACTIONS.forEach((act, i) => {
+      const cx = cols[i % 2];
+      const cy = rowStartY + Math.floor(i / 2) * rowGap;
+
+      const bg = this.add.graphics();
+      bg.fillStyle(0x000000, 0.18);
+      bg.fillRoundedRect(cx - 185, cy - 40, 370, 80, 10);
+      inner.add(bg);
+
+      const icon = this.add.image(cx - 150, cy, "GJ_GameSheet03", act.icon);
+      const f = this.textures.getFrame("GJ_GameSheet03", act.icon);
+      if (f) icon.setScale(Math.min(54 / f.width, 54 / f.height));
+      if (act.flipX) icon.setFlipX(true);
+      inner.add(icon);
+
+      const label = this.add.bitmapText(cx - 115, cy - 18, "bigFont", act.label, 26).setOrigin(0, 0.5);
+      this._fitBitmapText(label, 290);
+      inner.add(label);
+
+      const btn = this.add.nineslice(cx - 15, cy + 17, "GJ_button01", null, 200, 44, 18, 18, 18, 18)
+        .setOrigin(0.5).setInteractive();
+      const txt = this.add.bitmapText(cx - 17, cy + 15, "goldFont", "", 28).setOrigin(0.5);
+      inner.add([btn, txt]);
+      cells[act.id] = { btn, txt };
+      refreshCell(act.id);
+
+      this._makeCompositeBouncyButton(
+        btn,
+        [btn, { target: txt, getBaseScaleX: () => txt._kbScale, getBaseScaleY: () => txt._kbScale }],
+        1,
+        () => startListening(act.id)
+      );
+    });
+
+    // reset to defaults
+    inner.add(this.add.image(-105, 245, "GJ_GameSheet03", "GJ_resetBtn_001.png").setScale(0.8));
+    const resetBtn = this.add.nineslice(30, 245, "GJ_button01", null, 200, 50, 18, 18, 18, 18).setOrigin(0.5).setInteractive();
+    const resetTxt = this.add.bitmapText(28, 242, "goldFont", "Defaults", 36).setOrigin(0.5);
+    inner.add([resetBtn, resetTxt]);
+    this._makeCompositeBouncyButton(resetBtn, [resetBtn, resetTxt], 1, () => {
+      window.keybinds = {};
+      this._saveKeybinds();
+      this._applyKeybinds();
+      listening = null;
+      refreshAll();
+      status.setText("Reset to defaults");
+    });
+
+    // capture phase so Phaser (and the ESC handler) never see the key being bound
+    const onKey = (e) => {
+      if (!listening) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.repeat) return;
+      if (e.keyCode === 27) { stopListening(); return; }
+      if (KEYBIND_RESERVED.includes(e.keyCode)) { status.setText("That key is reserved"); return; }
+
+      const id = listening;
+      const old = this._getKeybind(id);
+      const other = KEYBIND_ACTIONS.find(a => a.id !== id && this._getKeybind(a.id) === e.keyCode);
+      window.keybinds = window.keybinds || {};
+      if (other) window.keybinds[other.id] = old;   // swap so two actions never share a key
+      window.keybinds[id] = e.keyCode;
+      this._saveKeybinds();
+      this._applyKeybinds();
+      listening = null;
+      refreshAll();
+      status.setText(other ? "Swapped with " + other.label : "Saved!");
+    };
+    window.addEventListener("keydown", onKey, true);
+    this._keybindPopupCleanup = () => window.removeEventListener("keydown", onKey, true);
+
+    this.tweens.add({
+      targets: inner,
+      scale: 1,
+      duration: 660,
+      ease: "Elastic.Out",
+      easeParams: [1, 0.6]
+    });
+  }
+  _setVerityMenuLoop(on) {
+    window.verityMenuLoop = !!on;
+    localStorage.setItem("verityMenuLoop", String(!!on));
+    const saved = localStorage.getItem("menuMusicEnabled");
+    const menuMusicOn = saved === null ? true : saved === "true";
+    const restart = () => {
+      if (!menuMusicOn || !this._menuActive) return;
+      if (this._audio.isplaying()) this._audio.stopMusic();
+      this._audio.startMenuMusic();
+    };
+    if (on && !this.cache.audio.exists(VERITY_MENU_LOOP_KEY)) {
+      this.load.audio(VERITY_MENU_LOOP_KEY, "assets/music/" + VERITY_MENU_LOOP_KEY + ".mp3");
+      this.load.once("complete", restart);
+      this.load.start();
+    } else {
+      restart();
+    }
+  }
+  _closeKeybindPopup() {
+    if (!this._keybindPopup) return;
+    if (this._keybindPopupCleanup) {
+      this._keybindPopupCleanup();
+      this._keybindPopupCleanup = null;
+    }
+    this._keybindPopup.destroy();
+    this._keybindPopup = null;
   }
   _buildMacroPopup() {
       if (this._macroPopup) return;
@@ -5461,13 +6263,13 @@ _buildSettingsPopup() {
       const panel = this._drawScale9(centerX, centerY, panelWidth, panelHeight, "GJ_square02", corner, 0xffffff, 1);
       this._macroPopup.add(panel);
 
-      this._macroPopup.add(this.add.bitmapText(centerX, centerY - (panelHeight / 2) + 45, "bigFont", "Web Bot v1.0", 40).setOrigin(0.5));
+      this._macroPopup.add(this.add.bitmapText(centerX, centerY - (panelHeight / 2) + 45, "bigFont", "Web Bot v2.1", 40).setOrigin(0.5));
 
-      if (this._macroName === undefined) {
+      if (this._macroName === undefined) {  
           this._macroName = this._macroBot?.meta?.name || null;
       }
       if (this._macroLoaded === undefined) {
-          this._macroLoaded = !!this._macroName || (this._macroBot && this._macroBot.inputs && this._macroBot.inputs.length > 0);
+          this._macroLoaded = !!this._macroName || (this._macroBot && this._macroBot.frames && this._macroBot.frames.length > 0);
       }
 
       const loadedNameText = this.add.bitmapText(centerX, centerY - (panelHeight / 2) + 95, "goldFont", this._macroLoaded ? `Currently loaded "${this._macroName || 'macro'}"` : "No macro loaded", 24).setOrigin(0.5);
@@ -5559,7 +6361,7 @@ _buildSettingsPopup() {
           if (this._macroBot?.playing) return;
           if (this._macroBot?.recording) return;
           if (!this._macroLoaded) return;
-          this._exportMacroFile(this._macroName ? `${this._macroName}.wbgdr` : null);
+          this._exportMacroFile(this._macroName ? `${this._macroName}.wbgdr2` : null);
       });
 
       this._makeBouncyButton(createBtn, 1.2, () => {
@@ -5780,6 +6582,243 @@ _buildSettingsPopup() {
       this._infoPopup = null;
     }
   } //im so tired of this
+  _showReqpopup() {
+    if (this._reqpopup) {
+      return;
+    }
+
+    const xPos = screenWidth / 2;
+    const centerY = screenHeight / 2;
+    const popupWidth = 475;
+    const popupContentHeight = 230;
+    this._reqpopup = this.add.container(0, 0).setScrollFactor(0).setDepth(1000);
+
+    const background = this.add.rectangle(xPos, centerY, screenWidth, screenHeight, 0, 100 / 255).setInteractive();
+    this._reqpopup.add(background);
+
+    const bounceContainer = this.add.container(xPos, centerY).setScale(0);
+    this._reqpopup.add(bounceContainer);
+
+    const cornerRadius = this.textures.get("GJ_square02").source[0].width * 0.325;
+    const popupBg = this._drawScale9(0, 0, popupWidth, popupContentHeight, "GJ_square02", cornerRadius, 16777215, 1);
+    bounceContainer.add(popupBg);
+
+    const closeBtn = this.add.image(-(popupWidth / 2) + 20, -(popupContentHeight / 2) + 20, "GJ_WebSheet", "GJ_closeBtn_001.png").setScale(0.95).setInteractive();
+    bounceContainer.add(closeBtn);
+    this._makeBouncyButton(closeBtn, 0.95, () => this._closeReqPopup());
+
+    const fakeloading = this.add.image(0, -10, "loadingCircle").setOrigin(0.5).setBlendMode(Phaser.BlendModes.ADD).setAlpha(0.5);
+    bounceContainer.add(fakeloading);
+
+    const statusText = this.add.text(0, popupContentHeight / 2 - 40, " Loading...", {
+      fontFamily: "Arial",
+      fontSize: "26px",
+      color: "#ffffff",
+      align: "center"
+    }).setOrigin(0.5, 0.5);
+    bounceContainer.add(statusText);
+
+    const spinTimer = this.time.addEvent({
+      delay: 16,
+      loop: true,
+      callback: () => {
+        if (!fakeloading.scene) {
+          spinTimer.remove();
+          return;
+        }
+        fakeloading.rotation += 0.1;
+      }
+    });
+
+    const failTimer = this.time.delayedCall(5000, () => {
+      if (!fakeloading.scene || !statusText.scene) return;
+      spinTimer.remove();
+      fakeloading.clearTint();
+      fakeloading.setBlendMode(Phaser.BlendModes.NORMAL);
+      fakeloading.setAlpha(1);
+      fakeloading.setTexture("GJ_GameSheet03", "exMark_001.png");
+      fakeloading.setRotation(0);
+      fakeloading.setScale(1.25);
+      fakeloading.y = -25;
+      statusText.setText("Failed. Please try again never. ");
+    });
+
+    this._reqpopupexit = () => {
+      spinTimer.remove();
+      failTimer.remove();
+    };
+
+    this.tweens.add({
+      targets: bounceContainer,
+      scale: { from: 0, to: 1 },
+      duration: 660,
+      ease: "Elastic.Out",
+      easeParams: [1, 0.6]
+    });
+  }
+  _closeReqPopup() {
+    if (this._reqpopup) {
+      if (this._reqpopupexit) {
+        this._reqpopupexit();
+        this._reqpopupexit = null;
+      }
+      this._reqpopup.destroy();
+      this._reqpopup = null;
+    }
+    }
+  _showcontactpopup() {
+    if (this._reqpopup) {
+      return;
+    }
+
+    const xPos = screenWidth / 2;
+    const centerY = screenHeight / 2;
+    const popupWidth = 500;
+    const popupContentHeight = 250;
+    this._reqpopup = this.add.container(0, 0).setScrollFactor(0).setDepth(1000);
+
+    const background = this.add.rectangle(xPos, centerY, screenWidth, screenHeight, 0, 100 / 255).setInteractive();
+    this._reqpopup.add(background);
+
+    const bounceContainer = this.add.container(xPos, centerY).setScale(0);
+    this._reqpopup.add(bounceContainer);
+
+    const cornerRadius = this.textures.get("GJ_square02").source[0].width * 0.325;
+    const popupBg = this._drawScale9(0, 0, popupWidth, popupContentHeight, "GJ_square02", cornerRadius, 16777215, 1);
+    bounceContainer.add(popupBg);
+
+    const closeBtn = this.add.image(-(popupWidth / 2) + 20, -(popupContentHeight / 2) + 20, "GJ_WebSheet", "GJ_closeBtn_001.png").setScale(1).setInteractive();
+    bounceContainer.add(closeBtn);
+    this._makeBouncyButton(closeBtn, 1, () => this._closeReqPopup());
+
+    const lock = this.add.image(0, 110, "GJ_GameSheet03", "GJ_lockGray_001.png").setOrigin(0.5).setSize(1.5);
+    bounceContainer.add(lock);
+
+
+    const statusText = this.add.text(0, popupContentHeight / 2 - 90, "Or, call 480-957-8838 for more info.", {
+      fontFamily: "Arial",
+      fontSize: "26px",
+      color: "#ffffff",
+      align: "center"
+    }).setOrigin(0.5, 0.5);
+    bounceContainer.add(statusText);
+
+    
+    const statusText2 = this.add.text(0, popupContentHeight / 2 - 130, "Message pinkdevyt on Discord,", {
+      fontFamily: "Arial",
+      fontSize: "26px",
+      color: "#ffffff",
+      align: "center"
+    }).setOrigin(0.5, 0.5);
+    bounceContainer.add(statusText2);
+
+    const statusText3 = this.add.text(0, popupContentHeight / 2 - 170, "Message ameth7st_nya on Discord,", {
+      fontFamily: "Arial",
+      fontSize: "26px",
+      color: "#ffffff",
+      align: "center"
+    }).setOrigin(0.5, 0.5);
+    bounceContainer.add(statusText3);
+
+    const statusText4 = this.add.text(0, popupContentHeight / 2 - 210, "Message lasokar on Discord,", {
+      fontFamily: "Arial",
+      fontSize: "26px",
+      color: "#ffffff",
+      align: "center"
+    }).setOrigin(0.5, 0.5);
+    bounceContainer.add(statusText4);
+
+    const statusText5 = this.add.text(0, popupContentHeight / 2 - 50, "(Pinkdev's real phone number btw)", {
+      fontFamily: "Arial",
+      fontSize: "17px",
+      color: "#92a7c0",
+      align: "center"
+    }).setOrigin(0.5, 0.5);
+    bounceContainer.add(statusText5);
+
+
+    this.tweens.add({
+      targets: bounceContainer,
+      scale: { from: 0, to: 1 },
+      duration: 660,
+      ease: "Elastic.Out",
+      easeParams: [1, 0.6]
+    });
+  }
+
+_showwippopup() {
+    if (this._reqpopup) {
+      return;
+    }
+
+    const xPos = screenWidth / 2;
+    const centerY = screenHeight / 2;
+    const popupWidth = 500;
+    const popupContentHeight = 200;
+    this._reqpopup = this.add.container(0, 0).setScrollFactor(0).setDepth(1000);
+
+    const background = this.add.rectangle(xPos, centerY, screenWidth, screenHeight, 0, 100 / 255).setInteractive();
+    this._reqpopup.add(background);
+
+    const bounceContainer = this.add.container(xPos, centerY).setScale(0);
+    this._reqpopup.add(bounceContainer);
+
+    const cornerRadius = this.textures.get("GJ_square02").source[0].width * 0.325;
+    const popupBg = this._drawScale9(0, 0, popupWidth, popupContentHeight, "GJ_square02", cornerRadius, 16777215, 1);
+    bounceContainer.add(popupBg);
+
+    const closeBtn = this.add.image(-(popupWidth / 2) + 20, -(popupContentHeight / 2) + 20, "GJ_WebSheet", "GJ_closeBtn_001.png").setScale(1).setInteractive();
+    bounceContainer.add(closeBtn);
+    this._makeBouncyButton(closeBtn, 1, () => this._closeReqPopup());
+
+    const allroadsleadtoparticles = this.add.image(0, 100, "GJ_GameSheet03", "GJ_timeIcon_001.png").setOrigin(0.5).setSize(1.5);
+    bounceContainer.add(allroadsleadtoparticles);
+
+
+    const text = this.add.text(0, popupContentHeight / 2 - 150, "Coming in another pr later!-", {
+      fontFamily: "Arial",
+      fontSize: "22px",
+      color: "#92a7c0",
+      align: "center"
+    }).setOrigin(0.5, 0.5);
+    bounceContainer.add(text);
+
+    const text1 = this.add.text(0, popupContentHeight / 2 - 100, "This is still being worked on.", {
+      fontFamily: "Arial",
+      fontSize: "26px",
+      color: "#ffffff",
+      align: "center"
+    }).setOrigin(0.5, 0.5);
+    bounceContainer.add(text1);
+
+    const text2 = this.add.text(0, popupContentHeight / 2 - 50, "Expect this to be finished with particles.", {
+      fontFamily: "Arial",
+      fontSize: "17px",
+      color: "#92a7c0",
+      align: "center"
+    }).setOrigin(0.5, 0.5);
+    bounceContainer.add(text2);
+
+
+    this.tweens.add({
+      targets: bounceContainer,
+      scale: { from: 0, to: 1 },
+      duration: 660,
+      ease: "Elastic.Out",
+      easeParams: [1, 0.6]
+    });
+  }
+
+  _closeReqPopup() {
+    if (this._reqpopup) {
+      if (this._reqpopupexit) {
+        this._reqpopupexit();
+        this._reqpopupexit = null;
+      }
+      this._reqpopup.destroy();
+      this._reqpopup = null;
+    }
+  }
   InfoBoxDoAThing(displayText) {
     if (this.EditInfoText) {
       this.InfoBoxStopAThing();
@@ -5853,7 +6892,6 @@ _buildSettingsPopup() {
       ease: "Back.Out"
     });
   }
-
   InfoBoxStopAThing() {
     if (!this.EditInfoText) return;
 
@@ -6069,22 +7107,21 @@ _buildSettingsPopup() {
     */
     const updateEntries = [
       { text: "Update Log", scale: 1, font: "goldFont" },
-	  { text: "Make Stereo Madness better", scale: 0.75, },
-	  { text: "Disable icon garage", scale: 0.75, },
-	  { text: "Change default icon and color", scale: 0.75, },
-      { text: "Made game more easy to hear", scale: 0.75, },
-      { text: "- spooky", scale: 0.65, color: 0xFF7B08 }
+      { text: "Sorry for the 10 hour downtime\ni forgot to change the proxy\nurl because i changed the\nsubdomain - rohanis0000", scale: 0.7, color: 0xaaddff },
+      { text: "To anyone who is wondering\nwhy online features don't work,\nthe worker is constantly being\nused and its request limit\nis hit daily in a short time\ndue to many users using\nthe online levels feature.\nThis has hopefully been\nfixed now with this update.\n- rohanis0000", scale: 0.7, color: 0xaaddff },
+      { text: "Added 2 new proxies to fall back\nto when ones request limit is\n hit to allow you to still\nbe able to use online features.", scale: 0.65 }
     ]; 
     let yPos = 0;
     const lineItems = [];
     updateEntries.forEach(entry => {
       const txt = this.add.bitmapText(0, yPos, entry.font || "bigFont", entry.text, 32)
         .setOrigin(0.5, 0)
+        .setCenterAlign()
         .setScale(entry.scale || 0.65);
       if (entry.color != null) txt.setTint(entry.color);
       contentContainer.add(txt);
       lineItems.push(txt);
-      yPos += Math.round(32 * (entry.scale || 0.65)) + 10;
+      yPos += txt.displayHeight + 10;
     });
     const totalContentH = yPos;
     const maxScrollDown = Math.max(0, totalContentH - scrollAreaH + 16);
@@ -6205,7 +7242,7 @@ _buildSettingsPopup() {
     bounceContainer.add(openGroup);
     openBtn.on("pointerdown", () => { openGroup._pressed = true; this.tweens.killTweensOf(openGroup); this.tweens.add({ targets: openGroup, scaleX: 1.26, scaleY: 1.26, duration: 300, ease: "Bounce.Out" }); });
     openBtn.on("pointerout", () => { if (openGroup._pressed) { openGroup._pressed = false; this.tweens.killTweensOf(openGroup); this.tweens.add({ targets: openGroup, scaleX: 1, scaleY: 1, duration: 400, ease: "Bounce.Out" }); } });
-    openBtn.on("pointerup", () => { if (openGroup._pressed) { openGroup._pressed = false; this.tweens.killTweensOf(openGroup); openGroup.setScale(1); this._closeNewgroundsPopup(); window.open("https://www.newgrounds.com/audio", "_blank"); } });
+    openBtn.on("pointerup", () => { if (openGroup._pressed) { openGroup._pressed = false; this.tweens.killTweensOf(openGroup); openGroup.setScale(1); this._closeNewgroundsPopup(); window.open("https://sites.google.com/ecsd.me/webdasherslist/home", "_blank"); } });
     this.tweens.add({
       targets: bounceContainer,
       scale: { from: 0, to: 1 },
@@ -6737,11 +7774,6 @@ _buildSettingsPopup() {
       return;
     }
 
-    if (!cancelInput) {
-      if (!this._clickHistory) this._clickHistory = [];
-      this._clickHistory.push(this.time.now);
-    }
-
     if (!this._slideIn && !this._state.isDead && !cancelInput) {
       this._state.upKeyDown = true;
       this._state.upKeyPressed = true;
@@ -6755,7 +7787,7 @@ _buildSettingsPopup() {
       }
       const _dualImmediateBeforeGravity = !!this._state.gravityFlipped;
       let _primaryImmediateJumped = false;
-      if (!this._state.isFlying && !this._state.isWave && !this._state.isUfo && this._state.canJump) {
+      if (!this._state.isFlying && !this._state.isWave && !this._state.isUfo && (this._state.canJump)) {
         this._player.updateJump(0);
         _primaryImmediateJumped = true;
       } else if (this._state.isUfo) {
@@ -6780,7 +7812,7 @@ _buildSettingsPopup() {
         const _secondaryImmediateBeforeGravity = !!this._state2.gravityFlipped;
         const _secondaryImmediateBallInput = this._state2.isBall && this._state2.upKeyPressed;
         const _secondaryImmediateSpiderInput = this._state2.isSpider && this._state2.upKeyPressed;
-        if (!this._state2.isFlying && !this._state2.isWave && !this._state2.isUfo && this._state2.canJump) {
+        if (!this._state2.isFlying && !this._state2.isWave && !this._state2.isUfo && (this._state2.canJump)) {
           this._player2.updateJump(0);
         } else if (this._state2.isUfo) {
           if (!this._player2._shouldPrioritizeUfoOrbInput?.()) {
@@ -6801,9 +7833,6 @@ _buildSettingsPopup() {
       }
     }
 
-    if (!ignoreMacro && this._macroBot) {
-      this._macroBot.recordEdge(true, this._physicsFrame);
-    }
   }
   _releaseButton(ignoreMacro = false) {
     this._state.upKeyDown = false;
@@ -6814,13 +7843,87 @@ _buildSettingsPopup() {
     this._state2.upKeyPressed = false;
     this._state2.queuedHold = false;
     this._state2._orbActivationConsumedForPress = false;
-    if (!ignoreMacro && this._macroBot) {
-      this._macroBot.recordEdge(false, this._physicsFrame);
-    }
+  }
+  _syncMusicRateToSpeed() {
+    const rate = window.speedHack || 1;
+    try {
+      if (typeof this._audio.setRate === "function") {
+        this._audio.setRate(rate);
+        return;
+      }
+      if (this._audio.music && typeof this._audio.music.setRate === "function") {
+        this._audio.music.setRate(rate);
+        return;
+      }
+      if (this._audio._music && typeof this._audio._music.setRate === "function") {
+        this._audio._music.setRate(rate);
+        return;
+      }
+      if (this._audio.sound && typeof this._audio.sound.rate !== "undefined") {
+        this._audio.sound.rate = rate;
+      }
+    } catch (e) {}
   }
   _initMacroBot() {
     this._macroBot = new MacroBot(this);
     window.macroBot = this._macroBot;
+  }
+  _forEachPlayerLayerSprite(callback) {
+    for (const p of [this._player, this._player2]) {
+      if (!p) continue;
+      const layerProps = [
+        "_playerSpriteLayer", "_playerGlowLayer", "_playerOverlayLayer", "_playerExtraLayer",
+        "_shipSpriteLayer", "_shipGlowLayer", "_shipOverlayLayer", "_shipExtraLayer",
+        "_ballSpriteLayer", "_ballGlowLayer", "_ballOverlayLayer",
+        "_waveSpriteLayer", "_waveGlowLayer", "_waveOverlayLayer",
+        "_birdSpriteLayer", "_birdGlowLayer", "_birdOverlayLayer", "_birdExtraLayer"
+      ];
+      for (const lp of layerProps) callback(p[lp]?.sprite);
+      for (const layer of p._robotLayers || []) callback(layer?.sprite);
+      for (const layer of p._spiderLayers || []) callback(layer?.sprite);
+    }
+  }
+  _applyRainbowIcon(deltaTime) {
+    if (!window.rainbowIcon) return;
+    this._rainbowHue = (this._rainbowHue || 0) + deltaTime * 0.002;
+    const t = this._rainbowHue;
+    const r = Math.floor(128 + 127 * Math.sin(t));
+    const g = Math.floor(128 + 127 * Math.sin(t + 2.094));
+    const b = Math.floor(128 + 127 * Math.sin(t + 4.188));
+    const color = (r << 16) | (g << 8) | b;
+    this._forEachPlayerLayerSprite((sprite) => {
+      if (sprite && sprite.setTint) {
+        try { sprite.setTint(color); } catch (e) {}
+      }
+    });
+    if (this._iconGridObjects) {
+      for (const obj of this._iconGridObjects) {
+        if (obj && obj.setTint) {
+          try { obj.setTint(color); } catch (e) {}
+        }
+      }
+    }
+  }
+  _restorePlayerColors() {
+    const mainTintProps = ["_playerSpriteLayer", "_playerExtraLayer", "_shipSpriteLayer", "_ballSpriteLayer", "_waveSpriteLayer", "_birdSpriteLayer", "_birdExtraLayer"];
+    const secondaryTintProps = ["_playerGlowLayer", "_playerOverlayLayer", "_shipGlowLayer", "_shipOverlayLayer", "_shipExtraLayer", "_ballGlowLayer", "_ballOverlayLayer", "_waveGlowLayer", "_waveOverlayLayer", "_birdGlowLayer", "_birdOverlayLayer"];
+    for (const p of [this._player, this._player2]) {
+      if (!p) continue;
+      for (const lp of mainTintProps) {
+        const sprite = p[lp]?.sprite;
+        if (sprite && sprite.setTint) { try { sprite.setTint(window.mainColor); } catch (e) {} }
+      }
+      for (const lp of secondaryTintProps) {
+        const sprite = p[lp]?.sprite;
+        if (sprite && sprite.setTint) { try { sprite.setTint(window.secondaryColor); } catch (e) {} }
+      }
+      for (const layer of p._robotLayers || []) {
+        if (layer?.sprite?.setTint) { try { layer.sprite.setTint(window.mainColor); } catch (e) {} }
+      }
+      for (const layer of p._spiderLayers || []) {
+        if (layer?.sprite?.setTint) { try { layer.sprite.setTint(window.mainColor); } catch (e) {} }
+      }
+    }
   }
   _startMacroRecording(meta = {}) {
     if (!this._macroBot) this._initMacroBot();
@@ -6850,7 +7953,7 @@ _buildSettingsPopup() {
   _importMacroFile() {
     const fileInput = document.createElement("input");
     fileInput.type = "file";
-    fileInput.accept = ".wbgdr";
+    fileInput.accept = ".wbgdr2";
 
     fileInput.onchange = async (e) => {
       const file = e.target.files?.[0];
@@ -6860,7 +7963,7 @@ _buildSettingsPopup() {
         if (!this._macroBot) this._initMacroBot();
         
         const macroData = await this._macroBot.importFile(file);
-        this._macroBot.inputs = Array.isArray(macroData.inputs) ? macroData.inputs.slice() : [];
+        this._macroBot.frames = Array.isArray(macroData.frames) ? macroData.frames.slice() : [];
         const fallback = file.name.replace(/\.[^/.]+$/, "");
         const macroName = macroData.meta?.name || fallback;
 
@@ -6885,7 +7988,7 @@ _buildSettingsPopup() {
       this._menuInfoBtn.x = screenWidth - 30 - 3;
     }
     if (this._copyrightText) {
-      this._copyrightText.x = screenWidth - 20;
+      this._copyrightText.x = screenWidth - 850;
     }
     if (this._tryMeImg) {
       this._tryMeImg.x = _0x1e5db8 + 260;
@@ -6900,9 +8003,9 @@ _buildSettingsPopup() {
       this._playBtn.y = 320;
     }
     if (this._downloadBtns) {
-      const _0x285ef7 = screenWidth - 130;
-      const _0x4a8263 = 570;
-      const _0x23d03e = 60;
+      const _0x285ef7 = screenWidth - 105;
+      const _0x4a8263 = 550;
+      const _0x23d03e = 100;
       for (let _0x1bdfae = 0; _0x1bdfae < this._downloadBtns.length; _0x1bdfae++) {
         const yOffset = _0x1bdfae === 1 ? -_0x23d03e : 0;
         this._downloadBtns[_0x1bdfae].setPosition(_0x285ef7, _0x4a8263 + yOffset);
@@ -7101,6 +8204,9 @@ _buildSettingsPopup() {
         this._enableDualMode();
       }
       this._level.fastForwardTriggers(pos.x, this._colorManager);
+      this._randomGamemodePortalActive.clear();
+      this._randomGamemodePreviousWorldX = Number.isFinite(Number(this._playerWorldX)) ? Number(this._playerWorldX) : null;
+      this._randomGamemodePreviousWorldY = Number.isFinite(Number(startPosY)) ? Number(startPosY) : null;
       if (this._player) {
         this._player._lastCollisionWorldX = Number.isFinite(Number(this._playerWorldX)) ? Number(this._playerWorldX) : null;
         this._player._lastCollisionWorldY = startPosY;
@@ -7110,6 +8216,8 @@ _buildSettingsPopup() {
     this._practiceBypassPending = false;
     this._audio.reset();
     this._audio.startMusic(musicOffset);
+    this._syncMusicRateToSpeed();
+    setTimeout(() => this._syncMusicRateToSpeed(), 50);
     this._paused = false;
     if (this._pauseContainer) {
       this._pauseContainer.destroy();
@@ -7226,6 +8334,10 @@ _buildSettingsPopup() {
     this._state.ballHitPad = checkpoint.ballHitPad || false;
     this._state._robotHold = !!checkpoint.robotHold;
     this._state._robotHoldTimer = checkpoint.robotHoldTimer || 0;
+
+    const checkpointRotation = Number.isFinite(Number(checkpoint.rotation)) ? Number(checkpoint.rotation) : 0;
+    const checkpointRotateActionActive = checkpoint.rotateActionActive !== undefined ? !!checkpoint.rotateActionActive: undefined;
+
     this._player.reset();
     this._state.isFlying = false;
     this._state.isBall = false;
@@ -7266,6 +8378,16 @@ _buildSettingsPopup() {
     this._state.isBird = checkpoint.isBird;
     this._state._robotHold = !!checkpoint.robotHold;
     this._state._robotHoldTimer = checkpoint.robotHoldTimer || 0;
+    
+    this._state.rotation = checkpointRotation;
+    this._player._rotation = checkpointRotation;
+    if (typeof this._player.setRotation === "function") {
+      try { this._player.setRotation(checkpointRotation); } catch (_) {}
+    }
+    if (checkpointRotateActionActive !== undefined) {
+      this._player.rotateActionActive = checkpointRotateActionActive;
+    }
+
     this._state.ignorePortals = true;
     this._state2.ignorePortals = true;
     this._level.resetGroundTiles(this._cameraX);
@@ -7367,8 +8489,12 @@ _buildSettingsPopup() {
     this._practiceBypassPending = false;
     if (window.practiceMusicSync) {
       this._audio.startMusic(this._getSongOffsetForWorldX(checkpoint.x));
+      this._syncMusicRateToSpeed();
+      setTimeout(() => this._syncMusicRateToSpeed(), 50);
     } else if (!this._audio.musicPlaying) {
       this._audio.startMusic();
+      this._syncMusicRateToSpeed();
+      setTimeout(() => this._syncMusicRateToSpeed(), 50);
     }
 
     if (this._player && this._player._hitboxTrail) {
@@ -7383,12 +8509,7 @@ _buildSettingsPopup() {
     this._deltaBuffer = 0;
     this._physicsFrame = checkpoint.physicsFrame;
     if (this._macroBot?.recording == true){
-      this._macroBot?.rollbackRecording(this._physicsFrame);
-      if (this._spaceKey.isDown || this._upKey.isDown || this._wKey.isDown || this._lKey.isDown){
-        this._macroBot.recordEdge(true, this._physicsFrame);
-      } else {
-        this._macroBot.recordEdge(false, this._physicsFrame);
-      }
+      this._macroBot.rollbackRecording(this._physicsFrame);
     }
     if (this._macroBot?.playing == true){
       this._macroBot?.rollbackPlayback(this._physicsFrame);
@@ -7592,7 +8713,13 @@ _buildSettingsPopup() {
     let rawPercent = (this._playerWorldX / this._level.endXPos) * 100;
     rawPercent = Math.min(100, Math.max(0, rawPercent));
     let displayValue;
-    if (this._levelWon) {
+    if (this._forcePlatformer) {
+      // Platformer mode uses elapsed gameplay time instead of level completion percentage.
+      const elapsed = Math.max(0, Math.floor(this._playTime || 0));
+      const minutes = Math.floor(elapsed / 60);
+      const seconds = elapsed % 60;
+      displayValue = `${minutes}:${String(seconds).padStart(2, "0")}`;
+    } else if (this._levelWon) {
       const p = this._interpolatedPercent || 0;
       if (window.percentageDecimals) {
         displayValue = p.toFixed(2) + "%";
@@ -7620,8 +8747,12 @@ _buildSettingsPopup() {
     } else {
       this._cpsIndicator.setText("0 CPS");
     }
-    if (this._state.upKeyDown){
-      this._cpsIndicator.setTint(0x00ff00);
+    if (this._state.upKeyDown && !this._levelWon && !this._state.isDead){
+      if (this._cpsIndicator.tint !== 0x00ff00) {
+        this._cpsIndicator.setTint(0x00ff00);
+        if (!this._clickHistory) this._clickHistory = [];
+        this._clickHistory.push(this.time.now);
+      }
     } else{
       this._cpsIndicator.setTint(0xffffff);
     }
@@ -7632,6 +8763,12 @@ _buildSettingsPopup() {
     if (this._macroBtn){
       this._macroBtn.setVisible(window.macroBot);
     }
+    const _kbOn = !!window.customKeybinds;
+    if (this._keybindBtn?.scene) {
+      this._keybindBtn.setVisible(_kbOn);
+      this._keybindBtnIcon?.setVisible(_kbOn);
+    }
+    if (!_kbOn && this._keybindPopup) this._closeKeybindPopup();
 
     this._fpsAccum += deltaTime;
     this._fpsFrames++;
@@ -7641,7 +8778,7 @@ _buildSettingsPopup() {
       this._fpsFrames = 0;
     }
     if (this._paused) {
-      if (!this._updateLogPopup && (this._spaceKey.isDown || this._upKey.isDown || this._wKey.isDown || this._lKey.isDown) && !this._spaceWasDown && !this._settingsPopup) {
+      if (!this._updateLogPopup && (this._spaceKey.isDown || this._upKey.isDown || this._wKey.isDown || this._lKey.isDown) && !this._spaceWasDown && !this._settingsPopup && !this._keybindPopup) {
         setTimeout(() => {
           this._resumeGame();
         }, 75);
@@ -7754,6 +8891,8 @@ _buildSettingsPopup() {
         if (this._firstPlay) {
           this._firstPlay = false;
           this._audio.startMusic();
+          this._syncMusicRateToSpeed();
+          setTimeout(() => this._syncMusicRateToSpeed(), 50);
         }
         this._pauseBtn.setVisible(true).setAlpha(0);
         this.tweens.add({
@@ -7801,6 +8940,8 @@ _buildSettingsPopup() {
     if (!this._levelWon && !this._state.isDead && this._level.endXPos > 0) {
       const _0x448396 = 600;
       if (this._playerWorldX >= this._level.endXPos - _0x448396) {
+        this._freecamActive = false;
+        this._freecamIndicator?.setVisible(false);
         this._levelWon = true;
         this._endPortalGameY = this._level._endPortalGameY || 240;
         this._triggerEndPortal();
@@ -7878,7 +9019,7 @@ _buildSettingsPopup() {
         }
       }
       this._deathTimer += deltaTime;
-      let _0x237728 = this._hadNewBest ? 1400 : 1000;
+      let _0x237728 = this._hadNewBest ? 1400 : (window.percentageDecimals ? 0 : 1000);
       if (this._deathTimer > _0x237728) {
         if (this._practicedMode.practiceMode) {
           this._respawnFromCheckpoint();
@@ -7894,6 +9035,7 @@ _buildSettingsPopup() {
     if (!window.enableLDM) {
       window._animTimer += deltaTime;
       for (let _as of window._animatedSprites) {
+        if (!_as || !_as.active || !_as.visible) continue;
         if (window._animTimer - (_as._lastAnimSwap || 0) >= _as._animInterval) {
           _as._lastAnimSwap = window._animTimer;
           _as._animIdx = (_as._animIdx + 1) % _as._animFrames.length;
@@ -7983,6 +9125,14 @@ _buildSettingsPopup() {
     let subStepDelta = subSteps > 0 ? quantizedDelta / subSteps : 0;
     let verticalDelta = subStepDelta * d;
     let horizontalDelta = subStepDelta * playerSpeed * d;
+    let platformerHorizontalDelta = 0;
+    if (this._forcePlatformer) {
+      const platformerLeft = !this._freecamActive && (this._aKey.isDown || this._leftKey.isDown);
+      const platformerRight = !this._freecamActive && (this._dKey.isDown || this._rightKey.isDown);
+      platformerHorizontalDelta = (platformerRight ? horizontalDelta : 0) - (platformerLeft ? horizontalDelta : 0);
+      if (platformerLeft !== platformerRight) this._state.platformerFacing = platformerLeft ? -1 : 1;
+      horizontalDelta = 0;
+    }
     const initialY = this._state.y;
     const initialY2 = this._state2.y;
     for (let i = 0; i < subSteps; i++) {
@@ -8002,7 +9152,26 @@ _buildSettingsPopup() {
       const _primarySharedBefore = this._getDualSharedSignature(this._state);
       this._player.updateJump(verticalDelta);
       this._state.y += this._state.yVelocity * verticalDelta;
+      if (this._forcePlatformer) {
+        // Resolve vertical contacts first at the current X. Horizontal motion is
+        // applied afterwards with a swept wall check, so touching hitboxes cannot
+        // leave the player stuck in a stale collider-surface state.
+        this._platformerMoveDir = Math.sign(platformerHorizontalDelta);
+        gdPlatBonk(this._player, this._playerWorldX);
+        if (this._isDual && !this._state2.isDead) gdPlatBonk(this._player2, this._playerWorldX);
+        if (this._state.platformerOnColliderSurface && !this._state.onGround && !this._state.onCeiling) {
+          this._state.platformerOnColliderSurface = false;
+        }
+      }
       this._player.checkCollisions(this._playerWorldX - centerX);
+      if (this._forcePlatformer) {
+        const beforeX = this._playerWorldX;
+        const allowedDelta = gdPlatSweep(this, beforeX, platformerHorizontalDelta);
+        this._playerWorldX = beforeX + allowedDelta;
+        if (Math.abs(allowedDelta - platformerHorizontalDelta) > 1e-6) {
+          this._platformerMoveDir = 0;
+        }
+      }
       const _primaryGravityChanged = this._isDual && !!this._state.gravityFlipped !== _primaryGravityBefore;
       let _primaryGravitySynced = false;
       if (this._isDual && this._getDualSharedSignature(this._state) !== _primarySharedBefore) {
@@ -8046,10 +9215,30 @@ _buildSettingsPopup() {
         }
         if (this._isDual) this._ensureDualFlyBounds();
       }
+      // Platformer visual rotation: robot and spider rotate while walking.
+      // This changes only sprite rotation; collision state remains controlled by checkCollisions().
+      if (this._forcePlatformer && Number.isFinite(platformerHorizontalDelta) && platformerHorizontalDelta !== 0) {
+        const _platformerTurn = Math.abs(platformerHorizontalDelta) * (this._state.isSpider ? 0.12 : 0.09);
+        if (this._state.isRobot || this._state.isSpider) {
+          this._player._rotation = (Number.isFinite(this._player._rotation) ? this._player._rotation : 0)
+            + Math.sign(platformerHorizontalDelta) * _platformerTurn;
+          if (typeof this._player.setRotation === "function") {
+            try { this._player.setRotation(this._player._rotation); } catch (_) {}
+          }
+        }
+        if (this._isDual && !this._state2.isDead && (this._state2.isRobot || this._state2.isSpider)) {
+          this._player2._rotation = (Number.isFinite(this._player2._rotation) ? this._player2._rotation : 0)
+            + Math.sign(platformerHorizontalDelta) * _platformerTurn;
+          if (typeof this._player2.setRotation === "function") {
+            try { this._player2.setRotation(this._player2._rotation); } catch (_) {}
+          }
+        }
+      }
+
       if (!this._state.isFlying && !this._state.isWave && !this._state.isUfo) {
         if (this._state.isBall) {
           const ballOnSurface = this._state.onGround || this._state.onCeiling;
-          this._player.updateBallRoll(horizontalDelta, ballOnSurface);
+          this._player.updateBallRoll(this._forcePlatformer ? platformerHorizontalDelta : horizontalDelta, ballOnSurface);
         } else if (this._state.onGround) {
           this._player.updateGroundRotation(verticalDelta);
         } else if (this._player.rotateActionActive) {
@@ -8061,7 +9250,7 @@ _buildSettingsPopup() {
       if (this._isDual && !this._state2.isDead && !this._state2.isFlying && !this._state2.isWave && !this._state2.isUfo) {
         if (this._state2.isBall) {
           const ball2OnSurface = this._state2.onGround || this._state2.onCeiling;
-          this._player2.updateBallRoll(horizontalDelta, ball2OnSurface);
+          this._player2.updateBallRoll(this._forcePlatformer ? platformerHorizontalDelta : horizontalDelta, ball2OnSurface);
         } else if (this._state2.onGround) {
           this._player2.updateGroundRotation(verticalDelta);
         } else if (this._player2.rotateActionActive) {
@@ -8085,39 +9274,53 @@ _buildSettingsPopup() {
           if (this._player2._hitboxTrail.length > 180) this._player2._hitboxTrail.shift();
         }
       }
+
+      if (this._macroBot?.playing) {
+        this._macroBot.applyCurrentFrame();
+      } else if (this._macroBot?.recording) {
+        this._macroBot.recordFrame(this._physicsFrame);
+      }
     }
+    this._randomizeGamemodePortals();
     this._state.lastY = initialY;
     if (this._isDual) this._state2.lastY = initialY2;
     this._state.ignorePortals = false;
     this._state2.ignorePortals = false;
     if (!this._endCameraOverride) {
-      const cameraOffsetX = this._playerWorldX - centerX;
-      if (this._level.endXPos > 0) {
-        const maxCameraX = this._level.endXPos - screenWidth;
-        if (cameraOffsetX >= maxCameraX - 200) {
-          this._endCameraOverride = true;
-          this._cameraX = cameraOffsetX;
-          const endCameraY = -140 + (this._level._endPortalGameY || 240);
-          const easingPower = 1.8;
-          const easeInOutCubic = t => t < 0.5 ? Math.pow(t * 2, easingPower) / 2 : 1 - Math.pow((1 - t) * 2, easingPower) / 2;
-          this._endCamTween = {
-            p: 0,
-            fromX: this._cameraX,
-            toX: maxCameraX,
-            fromY: this._cameraY,
-            toY: endCameraY
-          };
-          this.tweens.add({
-            targets: this._endCamTween,
-            p: 1,
-            duration: 1200,
-            ease: easeInOutCubic
-          });
+      if (this._freecamActive) {
+        const cameraDirection = (this._rightKey.isDown ? 1 : 0) - (this._leftKey.isDown ? 1 : 0);
+        if (cameraDirection) {
+          this._cameraX += cameraDirection * (deltaTime / (1000 / 60)) * this._freecamSpeed;
+        }
+      } else {
+        const cameraOffsetX = this._playerWorldX - centerX;
+        if (this._level.endXPos > 0) {
+          const maxCameraX = this._level.endXPos - screenWidth;
+          if (cameraOffsetX >= maxCameraX - 200) {
+            this._endCameraOverride = true;
+            this._cameraX = cameraOffsetX;
+            const endCameraY = -140 + (this._level._endPortalGameY || 240);
+            const easingPower = 1.8;
+            const easeInOutCubic = t => t < 0.5 ? Math.pow(t * 2, easingPower) / 2 : 1 - Math.pow((1 - t) * 2, easingPower) / 2;
+            this._endCamTween = {
+              p: 0,
+              fromX: this._cameraX,
+              toX: maxCameraX,
+              fromY: this._cameraY,
+              toY: endCameraY
+            };
+            this.tweens.add({
+              targets: this._endCamTween,
+              p: 1,
+              duration: 1200,
+              ease: easeInOutCubic
+            });
+          } else {
+            this._cameraX = cameraOffsetX;
+          }
         } else {
           this._cameraX = cameraOffsetX;
         }
-      } else {
-        this._cameraX = cameraOffsetX;
       }
     }
     if (this._endCameraOverride && this._endCamTween) {
@@ -8202,6 +9405,7 @@ _buildSettingsPopup() {
     if (this._isDual && !this._state2.isDead) {
       this._player2.syncSprites(this._cameraX, this._cameraY, deltaTime / 1000, this._getMirrorXOffset(playerScreenX));
     }
+    this._applyRainbowIcon(deltaTime);
     this._applyMirrorEffect();
   }
 
@@ -8254,22 +9458,92 @@ _applyMirrorEffect() {
   _getGamemodePortalMode(portalType) {
     switch (portalType) {
       case "portal_cube":
-        return "cube";
       case "portal_fly":
-        return "ship";
       case "portal_ball":
-        return "ball";
       case "portal_wave":
-        return "wave";
       case "portal_ufo":
-        return "ufo";
       case "portal_robot":
-        return "robot";
       case "portal_spider":
-        return "spider";
+        if (window.randomGamemode) {
+          const randomModes = ["cube", "ship", "ball", "ufo", "wave", "robot", "spider"];
+          return randomModes[Math.floor(Math.random() * randomModes.length)];
+        }
+        switch (portalType) {
+          case "portal_cube": return "cube";
+          case "portal_fly": return "ship";
+          case "portal_ball": return "ball";
+          case "portal_wave": return "wave";
+          case "portal_ufo": return "ufo";
+          case "portal_robot": return "robot";
+          case "portal_spider": return "spider";
+        }
+        break;
       default:
         return null;
     }
+  }
+  _randomizeGamemodePortals() {
+    if (!window.randomGamemode || !this._level || !this._player || this._state?.isDead || this._levelWon) return;
+
+    const worldX = Number(this._playerWorldX);
+    const worldY = Number(this._state?.y);
+    if (!Number.isFinite(worldX) || !Number.isFinite(worldY)) return;
+
+    const previousWorldX = Number.isFinite(this._randomGamemodePreviousWorldX)
+      ? this._randomGamemodePreviousWorldX
+      : worldX;
+    const previousWorldY = Number.isFinite(this._randomGamemodePreviousWorldY)
+      ? this._randomGamemodePreviousWorldY
+      : worldY;
+
+    const nearbyObjects = this._level.getNearbySectionObjects?.(worldX) || [];
+    const previousNearbyObjects = previousWorldX !== worldX
+      ? (this._level.getNearbySectionObjects?.(previousWorldX) || [])
+      : [];
+    const portalObjects = [...new Set([...nearbyObjects, ...previousNearbyObjects])];
+    const touchedNow = new Set();
+    const halfSize = this._state.isWave
+      ? (this._state.isMini ? 6 : 9)
+      : (this._state.isMini ? 18 : 30);
+
+    const gamemodePortalTypes = new Set([
+      "portal_cube", "portal_fly", "portal_ball", "portal_wave",
+      "portal_ufo", "portal_robot", "portal_spider"
+    ]);
+
+    for (const gameObj of portalObjects) {
+      if (!gameObj || !gamemodePortalTypes.has(gameObj.type)) continue;
+
+      let touching = false;
+      if (gameObj.hitbox_radius !== undefined && gameObj.hitbox_radius !== null) {
+        const radius = gameObj.hitbox_radius + halfSize;
+        const dx = worldX - gameObj.x;
+        const dy = worldY - gameObj.y;
+        touching = (dx * dx + dy * dy) <= radius * radius;
+
+        if (!touching && (previousWorldX !== worldX || previousWorldY !== worldY)) {
+          const prevDx = previousWorldX - gameObj.x;
+          const prevDy = previousWorldY - gameObj.y;
+          touching = (prevDx * prevDx + prevDy * prevDy) <= radius * radius;
+        }
+      } else if (typeof this._player._isPlayerTouchingPortalHitbox === "function") {
+        touching = this._player._isPlayerTouchingPortalHitbox(
+          gameObj, worldX, worldY, halfSize, previousWorldX, previousWorldY
+        );
+      }
+
+      if (!touching) continue;
+      touchedNow.add(gameObj);
+
+      if (!this._randomGamemodePortalActive.has(gameObj)) {
+        const mode = this._getGamemodePortalMode(gameObj.type);
+        if (mode) this._setPlayerGamemode(this._player, this._state, mode, true);
+      }
+    }
+
+    this._randomGamemodePortalActive = touchedNow;
+    this._randomGamemodePreviousWorldX = worldX;
+    this._randomGamemodePreviousWorldY = worldY;
   }
   _setPlayerGamemode(player, state, mode, keepVelocity = true) {
     if (!player || !state) return;
@@ -8643,8 +9917,7 @@ _applyMirrorEffect() {
       }
     });
   }
-
-    _triggerEndPortal() {
+  _triggerEndPortal() {
     if (this._isDual && this._player2 && this._state2 && !this._state2.isDead) {
       this._player2.playEndAnimation(this._level.endXPos, () => {}, this._endPortalGameY);
     }
@@ -8652,6 +9925,13 @@ _applyMirrorEffect() {
   }
   _levelComplete() {
     if (!this._practicedMode.practiceMode) {
+      const isNonPersistentCoinLevel = window.isEditor || this._level?._isStoredUserLevel?.();
+      if (isNonPersistentCoinLevel) {
+        this._level.resetCoinsForEditorCompletion?.();
+      } else {
+        this._level.commitSecretCoins?.();
+        this._level.commitUserCoins?.();
+      }
       this._bestPercent = 100;
       localStorage.setItem("bestPercent_" + (window.currentlevel[2] || "level_1"), 100);
       const completedKey = "gd_completedSet";
@@ -8679,7 +9959,6 @@ _applyMirrorEffect() {
     this._showCompleteEffect();
   }
   _showCompleteEffect() {
-    this._audio.fadeOutMusic(1500);
     this.sound.play("endStart_02", {
       volume: 0.8 * this._sfxVolume
     });
@@ -8836,6 +10115,10 @@ _applyMirrorEffect() {
     }
     this.time.delayedCall(1500, () => this._showEndLayer());
   }
+  _isMainLevelForCoinDisplay() {
+    const levelId = window.currentlevel?.[2];
+    return !!levelId && Array.isArray(window.allLevels) && window.allLevels.some(level => level?.[2] === levelId);
+  }
   _showEndLayer() {
     if (this._pauseBtn) {
       this.tweens.add({
@@ -8864,7 +10147,14 @@ _applyMirrorEffect() {
       onUpdate: () => {
         this._endLayerInternal.y = _0x59b9ab.p * 650 - 640;
       },
-      onComplete: () => this._playStarAward()
+      onComplete: () => {
+        if (this._isMainLevelForCoinDisplay()) {
+          this._playsecretcoinanimation();
+        } else {
+          this._playusercoinanimation();
+        }
+        this.time.delayedCall(250, () => this._playStarAward());
+      }
     });
     const _0x595215 = 712;
     const _0x950c8d = 460;
@@ -8881,15 +10171,15 @@ _applyMirrorEffect() {
     this._endLayerInternal.add(this.add.image(containerX - 312, _0x3e9c79, "GJ_WebSheet", "chain_01_001.png").setOrigin(0.5, 1));
     this._endLayerInternal.add(this.add.image(containerX + 312, _0x3e9c79, "GJ_WebSheet", "chain_01_001.png").setOrigin(0.5, 1));
     const _completeBanner = this._practicedMode.practiceMode
-      ? this.add.image(containerX, 170, "GJ_GameSheet03", "GJ_practiceComplete_001.png").setScale(0.8)
-      : this.add.image(containerX, 170, "GJ_WebSheet", "GJ_levelComplete_001.png").setScale(0.8);
+      ? this.add.image(containerX, 170, "GJ_GameSheet03", "GJ_practiceComplete_001.png").setScale(0.85)
+      : this.add.image(containerX, 170, "GJ_WebSheet", "GJ_levelComplete_001.png").setScale(0.85);
     this._endLayerInternal.add(_completeBanner);
     const _0x45b6e4 = 0.8;
     let _0xe44f6d = 250;
-    const _0x2de55e = this.add.bitmapText(containerX, _0xe44f6d, "goldFont", "Attempts: " + this._levelAttempts, 40).setOrigin(0.5, 0.5).setScale(_0x45b6e4);
+    const _0x2de55e = this.add.bitmapText(containerX, _0xe44f6d, "goldFont", "Attempts: " + this._levelAttempts, 46).setOrigin(0.5, 0.5).setScale(_0x45b6e4);
     this._endLayerInternal.add(_0x2de55e);
     _0xe44f6d += 48;
-    this._endLayerInternal.add(this.add.bitmapText(containerX, _0xe44f6d, "goldFont", "Jumps: " + this._levelJumps, 40).setOrigin(0.5, 0.5).setScale(_0x45b6e4));
+    this._endLayerInternal.add(this.add.bitmapText(containerX, _0xe44f6d, "goldFont", "Jumps: " + this._levelJumps, 46).setOrigin(0.5, 0.5).setScale(_0x45b6e4));
     _0xe44f6d += 48;
     const _0x596450 = Math.floor(this._playTime);
     const _0x30687e = Math.floor(_0x596450 / 3600);
@@ -8898,28 +10188,87 @@ _applyMirrorEffect() {
     let _0x2be782;
     _0x2be782 = _0x30687e > 0 ? String(_0x30687e).padStart(2, "0") + ":" + String(_0x52f8ee).padStart(2, "0") + ":" + String(_0x2591d0).padStart(2, "0") : String(_0x52f8ee).padStart(2, "0") + ":" + String(_0x2591d0).padStart(2, "0");
     const _0x241209 = _0xe44f6d;
-    this._endLayerInternal.add(this.add.bitmapText(containerX, _0xe44f6d, "goldFont", "Time: " + _0x2be782, 40).setOrigin(0.5, 0.5).setScale(_0x45b6e4));
-    const _0x452429 = ["Awesome!", "Good\nJob!", "Well\nDone!", "Impressive!", "Amazing!", "Incredible!", "Skillful!", "Brilliant!", "Not\nbad!", "Warp\nSpeed!", "Challenge\nBreaker!", "Reflex\nMaster!", "I am\nspeechless...", "You are...\nThe One!", "How is this\npossible!?", "You beat\nme..."];
-    const _0x165c06 = _0x452429[Math.floor(Math.random() * _0x452429.length)];
-    const _0x45540f = 225;
-    const _0x8e2b = ["\x5f\x6d\x61\x63\x72\x6f\x42\x6f\x74", "\x70\x6c\x61\x79\x69\x6e\x67"];let _0x3bc14 = 0xffffff; try {if (this[_0x8e2b[0]] && this[_0x8e2b[0]][_0x8e2b[1]]) {_0x3bc14 = (_0x3bc14 & 0xffff00) | 0xfa;}} catch (_0xe31) {}const _0x17fa2b = this.add.bitmapText(containerX + _0x45540f, _0x241209, "bigFont", _0x165c06, 40).setOrigin(0.5, 0.5).setScale(0.8).setCenterAlign();if (_0x3bc14 !== 0xffffff) _0x17fa2b.setTint(_0x3bc14);
-    this._endLayerInternal.add(_0x17fa2b);
-    this._endLayerInternal.add(this.add.image(containerX - _0x45540f, 352.5, "GJ_WebSheet", "getIt_001.png").setScale(1 / 1.5));
-    const _0x34b1bd = [{
-      key: "downloadApple_001",
-      url: "https://discord.gg/TfEzAVWPSJ"
-    }, {
-      key: "downloadSteam_001",
-      url: "https://github.com/spooky14237/web-dasher"
-    }];
-    for (let _0x10f8cc = 0; _0x10f8cc < _0x34b1bd.length; _0x10f8cc++) {
-      const _0xd7310b = _0x34b1bd[_0x10f8cc];
-      const _0x1e3f82 = (_0x10f8cc - 1) * _0x45540f;
-      const _0x55a82e = 1 / 1.5;
-      const _0x4c7fb8 = this.add.image(containerX + _0x1e3f82, 437.5, "GJ_WebSheet", _0xd7310b.key + ".png").setScale(_0x55a82e).setInteractive();
-      this._endLayerInternal.add(_0x4c7fb8);
-      this._makeBouncyButton(_0x4c7fb8, _0x55a82e, () => window.open(_0xd7310b.url, "_blank"));
+    this._endLayerInternal.add(this.add.bitmapText(containerX, _0xe44f6d, "goldFont", "Time: " + _0x2be782, 46).setOrigin(0.5, 0.5).setScale(_0x45b6e4));
+    const isMainLevel = this._isMainLevelForCoinDisplay();
+    const coinSprites = (this._level?._coinSprites || []).filter(sprite => isMainLevel
+      ? sprite?._secretCoinSlot !== undefined
+      : sprite?._userCoinSlot !== undefined);
+    const coinCount = Math.min(3, coinSprites.length);
+    const coinOffsets = coinCount === 1
+      ? [0]
+      : coinCount === 2
+        ? [-60, 60]
+        : [-120, 0, 120];
+    const completionMessageY = coinCount > 0 ? _0x241209 : _0x241209 + 96;
+    this._endsecretcoinPositions = isMainLevel
+      ? coinOffsets.map(offset => ({ x: containerX + offset, y: 445 }))
+      : null;
+    let savedSecretCoinSlots = new Set();
+    try {
+      const savedSlots = JSON.parse(localStorage.getItem(`gd_secretCoins_${window.currentlevel?.[2] || "level_1"}_slots`) || "[]");
+      if (Array.isArray(savedSlots)) {
+        savedSecretCoinSlots = new Set(savedSlots.filter(slot => Number.isInteger(slot) && slot >= 0 && slot < 3));
+      }
+    } catch (_error) {}
+    const runSecretCoinSlots = this._level?._editorEndSecretCoinSlots
+      ? new Set(this._level._editorEndSecretCoinSlots)
+      : new Set(
+        (this._level?._coinSprites || [])
+          .filter(sprite => this._level?._secretCoinRunCollected?.has(String(sprite?._secretCoinId)))
+          .map(sprite => sprite?._secretCoinSlot)
+          .filter(slot => Number.isInteger(slot))
+      );
+    this._endsecretcoinPositions?.forEach(({ x, y }, slot) => {
+      if (savedSecretCoinSlots.has(slot) && !runSecretCoinSlots.has(slot)) return;
+      this._endLayerInternal.add(
+        this.add.image(x, y, "GJ_GameSheet02", "secretCoin_b_01_001.png")
+          .setOrigin(0.5)
+          .setScale(1.1)
+      );
+    });
+    for (const slot of savedSecretCoinSlots) {
+      if (!this._endsecretcoinPositions) break;
+      if (runSecretCoinSlots.has(slot)) continue;
+      const position = this._endsecretcoinPositions[slot];
+      this._endLayerInternal.add(
+        this.add.image(position.x, position.y, "GJ_GameSheet03", "secretCoinUI_001.png")
+          .setOrigin(0.5)
+          .setScale(1.1)
+      );
     }
+    this._endusercoinPosition = null;
+    if (!isMainLevel && coinCount > 0) {
+      this._endusercoinPosition = coinOffsets.map(offset => ({ x: containerX + offset, y: 445 }));
+      let savedUserCoinSlots = new Set();
+      try {
+        const savedSlots = JSON.parse(localStorage.getItem(`gd_userCoins_${window.currentlevel?.[2] || "level_1"}_slots`) || "[]");
+        if (Array.isArray(savedSlots)) {
+          savedUserCoinSlots = new Set(savedSlots.filter(slot => Number.isInteger(slot) && slot >= 0 && slot < 3));
+        }
+      } catch (_error) {}
+      const runUserCoinSlots = this._level?._editorEndUserCoinSlots
+        ? new Set(this._level._editorEndUserCoinSlots)
+        : new Set(
+          (this._level?._coinSprites || [])
+            .filter(sprite => this._level?._userCoinRunCollected?.has(String(sprite?._userCoinId)))
+            .map(sprite => sprite?._userCoinSlot)
+            .filter(slot => Number.isInteger(slot))
+        );
+      this._endusercoinPosition.forEach(({ x, y }, slot) => {
+        if (savedUserCoinSlots.has(slot) && !runUserCoinSlots.has(slot)) return;
+        this._endLayerInternal.add(this.add.image(x, y, "GJ_GameSheet02", "secretCoin_2_b_01_001.png").setOrigin(0.5));
+      });
+      for (const slot of savedUserCoinSlots) {
+        if (runUserCoinSlots.has(slot)) continue;
+        const position = this._endusercoinPosition[slot];
+        this._endLayerInternal.add(this.add.image(position.x, position.y, "GJ_GameSheet0", "secretCoinUI2_001.png").setOrigin(0.5));
+      }
+    }
+    const _0x452429 = ["Awesome!", "Good\nJob!", "Well\nDone!", "Impressive!", "Amazing!", "Incredible!", "Skillful!", "Brilliant!", "Not\nbad!", "Warp\nSpeed!", "Challenge\nBreaker!", "Reflex\nMaster!", "I am\nspeechless...", "You are...\nThe One!", "How is this\npossible!?", "You beat\nme...", /* "You cannot beat a level with Noclip enabled.", "You cannot beat a level with Speedhack enabled.", "Safe Mode enabled."*/];
+    const _0x165c06 = _0x452429[Math.floor(Math.random() * _0x452429.length)];
+    const _0x45540f = 235;
+    const _0x8e2b = ["\x5f\x6d\x61\x63\x72\x6f\x42\x6f\x74", "\x70\x6c\x61\x79\x69\x6e\x67"];let _0x3bc14 = 0xffffff; try {if (this[_0x8e2b[0]] && this[_0x8e2b[0]][_0x8e2b[1]]) {_0x3bc14 = (_0x3bc14 & 0xffff00) | 0xfa;}} catch (_0xe31) {}const _0x17fa2b = this.add.bitmapText(coinCount > 0 ? containerX + _0x45540f : containerX, completionMessageY, "bigFont", coinCount > 0 ? _0x165c06 : _0x165c06.replace(/\n/g, " "), coinCount > 0 ? 40 : 46).setOrigin(0.5, 0.5).setScale(coinCount > 0 ? 0.8 : 0.9).setCenterAlign();if (_0x3bc14 !== 0xffffff) _0x17fa2b.setTint(_0x3bc14);
+    this._endLayerInternal.add(_0x17fa2b);
     _0x2de55e.width;
     this._endStarX = containerX + _0x45540f;
     this._endStarY = _0x241209 - 77.5;
@@ -8943,6 +10292,9 @@ _applyMirrorEffect() {
       action: () => {
         this._audio.playEffect("quitSound_01");
         this._audio.stopMusic();
+        if (this._isMainLevelForCoinDisplay()) {
+          window._mainLevelReturnToSelect = true;
+        }
         this.game.registry.set("fadeInFromBlack", true);
         this.cameras.main.fadeOut(400, 0, 0, 0, (_0x53bf86, _0x15310d) => {
           if (_0x15310d >= 1) {
@@ -8957,6 +10309,235 @@ _applyMirrorEffect() {
       this._makeBouncyButton(_0xdde774, 1, _0x2d4335.action);
     }
   }
+
+      _buildhelppopup() {
+    this._Helpclosed = false;
+    if (this._pauseBtn) {
+      this.tweens.add({
+        targets: this._pauseBtn,
+        alpha: 0,
+        duration: 300
+      });
+    }
+
+    const containerX = screenWidth / 2;
+    const _0x1aa656 = 320;
+    this._helpoverlay = this.add.rectangle(containerX, _0x1aa656, screenWidth, screenHeight, 0, 0).setScrollFactor(0).setDepth(200).setInteractive();
+    this._helplayer = this.add.container(0, -640).setScrollFactor(0).setDepth(201);
+    this._helplayer.add(this.add.bitmapText(containerX, 65, "bigFont", "Support", 55).setOrigin(0.5, 0.5));
+    this._helpclose = false;
+    this.tweens.add({
+      targets: this._helpoverlay,
+      alpha: 180 / 255,
+      duration: 250,
+      ease: "Linear"
+    });
+
+    const _0x59b9ab = {
+      p: 0
+    };
+    this.tweens.add({
+      targets: _0x59b9ab,
+      p: 1,
+      duration: 450,
+      ease: "Quad.Out",
+      onUpdate: () => {
+        this._helplayer.y = _0x59b9ab.p * 650 - 640;
+      },
+      onComplete: () => {}
+    });
+        this._playusercoinanimation();
+
+    const _0x595215 = 712;
+    const _0x950c8d = 460;
+    const _0x2a115c = (screenWidth - _0x595215) / 2;
+    this._helplayer.add(this.add.rectangle(_0x2a115c + 356, 310, _0x595215, _0x950c8d, 0, 180 / 255));
+    const _0x43f2e3 = this.textures.getFrame("GJ_WebSheet", "GJ_table_side_001.png");
+    const _0x3feccc = _0x43f2e3 ? _0x950c8d / _0x43f2e3.height : 1;
+    this._helplayer.add(this.add.image(_0x2a115c - 40, 80, "GJ_WebSheet", "GJ_table_side_001.png").setOrigin(0, 0).setScale(1, _0x3feccc));
+    this._helplayer.add(this.add.image(_0x2a115c + _0x595215 + 40, 80, "GJ_WebSheet", "GJ_table_side_001.png").setOrigin(1, 0).setFlipX(true).setScale(1, _0x3feccc));
+    const _0x33b564 = this.add.image(_0x2a115c + 356, 70, "GJ_WebSheet", "GJ_table_top_001.png");
+    this._helplayer.add(_0x33b564);
+    this._helplayer.add(this.add.image(_0x2a115c + 356, 560, "GJ_WebSheet", "GJ_table_bottom_001.png"));
+    const _0x3e9c79 = _0x33b564.y - 35;
+    this._helplayer.add(this.add.bitmapText(containerX, 65, "bigFont", "Support", 55).setOrigin(0.5, 0.5));
+    this._helplayer.add(this.add.image(containerX - 312, _0x3e9c79, "GJ_WebSheet", "chain_01_001.png").setOrigin(0.5, 1));
+    this._helplayer.add(this.add.image(containerX + 312, _0x3e9c79, "GJ_WebSheet", "chain_01_001.png").setOrigin(0.5, 1));
+    this._helplayer.add(this.add.image(_0x2a115c + 258, 285, "GJ_GameSheet03", "developedBy_001.png"));
+    const robtopSupportLogo = this.add.image(_0x2a115c + 440, 285, "GJ_GameSheet03", "robtoplogo_small.png").setScale(0.95).setInteractive();
+    this._makeBouncyButton(robtopSupportLogo, 0.95, () => {
+      window.open("https://geometrydash.com", "_blank");
+    }, () => !this._helpclose);
+    this._helplayer.add(robtopSupportLogo);
+    this._helplayer.add(this.add.image(_0x2a115c + 250, 375, "GJ_GameSheet03", "poweredBy_001.png"));
+    const phaserlogo = this.add.image(_0x2a115c + 432, 380, "Phaserlogo").setScale(0.1).setInteractive();
+    this._makeBouncyButton(phaserlogo, 0.1, () => {
+      window.open("https://docs.phaser.io/", "_blank");
+    }, () => !this._helpclose);
+    this._helplayer.add(phaserlogo);
+    this._helplayer.add(this.add.bitmapText(containerX, 440, "goldFont", "Web Dashers not associated with RobTop Games", 22).setOrigin(0.5, 0.5));
+
+    const _helpbuttonborder = this.textures.get("GJ_button01").source[0].width * 0.3;
+    const _helpbtnh = 70;
+    const _helpbtnw = 195;
+    const _helpBtnGap = 52.5;
+    const _helpBtnY = 180;
+    const _makesupportButton = (cx, label, action) => {
+      const grp = this.add.container(cx, _helpBtnY);
+      const btn9 = this.add.nineslice(0, 0, "GJ_button01", null, _helpbtnw, _helpbtnh, _helpbuttonborder, _helpbuttonborder, _helpbuttonborder, _helpbuttonborder).setOrigin(0.5).setTint(0xffffff);
+      grp.add(btn9);
+      const lbl = this.add.bitmapText(0, -5, "bigFont", label, 40).setOrigin(0.5, 0.5);
+      grp.add(lbl);
+      const hitZone = this.add.zone(0, 0, _helpbtnw, _helpbtnh).setInteractive();
+      grp.add(hitZone);
+      const baseScale = 1;
+      const pressedScale = baseScale * 1.26;
+      hitZone.on("pointerdown", () => {
+        hitZone._pressed = true;
+        this.tweens.killTweensOf(grp, "scale");
+        this.tweens.add({ targets: grp, scale: pressedScale, duration: 300, ease: "Bounce.Out" });
+      });
+      hitZone.on("pointerout", () => {
+        if (hitZone._pressed) {
+          hitZone._pressed = false;
+          this.tweens.killTweensOf(grp, "scale");
+          this.tweens.add({ targets: grp, scale: baseScale, duration: 400, ease: "Bounce.Out" });
+        }
+      });
+      hitZone.on("pointerup", () => {
+        if (hitZone._pressed) {
+          hitZone._pressed = false;
+          this.tweens.killTweensOf(grp, "scale");
+          grp.setScale(baseScale);
+          action?.();
+        }
+      });
+      this._helplayer.add(grp);
+      return grp;
+    };
+
+    _makesupportButton(containerX - _helpbtnw - _helpBtnGap / 2, "Links", () => {
+      this._showwippopup();
+    });
+    _makesupportButton(containerX, "Contact", () => {
+      this._showcontactpopup();
+    });
+    _makesupportButton(containerX + _helpbtnw + _helpBtnGap / 2, "Notes", () => {
+      this._showwippopup();
+    });
+
+    const ldmX = _0x2a115c + 160;
+    const ldmY = 495;
+    const ldmCheckOffset = -120;
+    const ldmTextOffset = -80;
+    
+    var ldmIsOn = window.enableLDM;
+    var ldmCheckTexture = ldmIsOn ? "GJ_checkOn_001.png" : "GJ_checkOff_001.png";
+    var ldmCheck = this.add.image(ldmX + ldmCheckOffset, ldmY, "GJ_GameSheet03", ldmCheckTexture).setScale(0.8).setInteractive();
+    var ldmTxt = this.add.bitmapText(ldmX + ldmTextOffset, ldmY, "bigFont", "Low Detail Mode", 25).setOrigin(0, 0.5);
+    this._helplayer.add([ldmCheck, ldmTxt]);
+
+    this._makeBouncyButton(ldmCheck, 0.8, () => {
+        var current = window.enableLDM;
+        window.enableLDM = !current;
+        var newTexture = window.enableLDM ? "GJ_checkOn_001.png" : "GJ_checkOff_001.png";
+        ldmCheck.setTexture("GJ_GameSheet03", newTexture);
+        if (this._saveSettings) {
+            this._saveSettings();
+        }
+    });
+
+    const reqbtnX = _0x2a115c + 655;
+    const reqbtnY = 495;
+    const reqbtnW = 80;
+    const reqbtnH = 55;
+    const reqbtnborder = (this.textures.get("GJ_button04")?.source[0].width || 40) * 0.3;
+    const reqbtn = this.add.nineslice(reqbtnX, reqbtnY, "GJ_button04", null, reqbtnW, reqbtnH, reqbtnborder, reqbtnborder, reqbtnborder, reqbtnborder).setInteractive().setOrigin(0.5).setTint(0xffffff);
+    const reqLbl = this.add.bitmapText(reqbtnX, reqbtnY - 2, "bigFont", "Req", 28).setOrigin(0.5, 0.5);
+    this._helplayer.add([reqbtn, reqLbl]);
+    this._makeCompositeBouncyButton(reqbtn, [reqbtn, reqLbl], 0.8, () => this._showReqpopup());
+
+    const closeBtn = this.add.image(containerX - 535, 30, "GJ_GameSheet03", "GJ_arrow_03_001.png").setInteractive();
+    this._helplayer.add(closeBtn);
+    this._makeBouncyButton(closeBtn, 1, () => this._hideHelpPopup());
+  }
+    _buildsongspopup() {
+    this._songpopupclose = false;
+    if (this._pauseBtn) {
+      this.tweens.add({
+        targets: this._pauseBtn,
+        alpha: 0,
+        duration: 300
+      });
+    }
+
+    const containerX = screenWidth / 2;
+    const _0x1aa656 = 320;
+    this._songsoverlay = this.add.rectangle(containerX, _0x1aa656, screenWidth, screenHeight, 0, 0).setScrollFactor(0).setDepth(200).setInteractive();
+    this._songslayer = this.add.container(0, -640).setScrollFactor(0).setDepth(201);
+    this._songpopupclose = false;
+    this.tweens.add({
+      targets: this._songsoverlay,
+      alpha: 100 / 255,
+      duration: 1000
+    });
+
+    const _0x59b9ab = {
+      p: 0
+    };
+    this.tweens.add({
+      targets: _0x59b9ab,
+      p: 1,
+      duration: 500,
+      ease: "Quad.Out",
+      onUpdate: () => {
+        this._songslayer.y = _0x59b9ab.p * 650 - 640;
+      }
+    });
+    const _0x595215 = 712;
+    const _0x950c8d = 460;
+    const _0x2a115c = (screenWidth - _0x595215) / 2;
+
+    const panelBase = this.add.rectangle(_0x2a115c + 356, 310, _0x595215, _0x950c8d, 0xac531e).setDepth(150);
+    this._songslayer.add(panelBase);
+    const _0x43f2e3 = this.textures.getFrame("GJ_WebSheet", "GJ_table_side_001.png");
+    const _0x3feccc = _0x43f2e3 ? _0x950c8d / _0x43f2e3.height : 1;
+    this._songslayer.add(this.add.image(_0x2a115c - 40, 80, "GJ_WebSheet", "GJ_table_side_001.png").setOrigin(0, 0).setScale(1, _0x3feccc).setDepth(200));
+    this._songslayer.add(this.add.image(_0x2a115c + _0x595215 + 40, 80, "GJ_WebSheet", "GJ_table_side_001.png").setOrigin(1, 0).setFlipX(true).setScale(1, _0x3feccc).setDepth(200));
+    const _0x33b564 = this.add.image(_0x2a115c + 356, 70, "GJ_WebSheet", "GJ_table_top_001.png").setDepth(200);
+    this._songslayer.add(_0x33b564);
+    this._songslayer.add(this.add.image(_0x2a115c + 356, 560, "GJ_WebSheet", "GJ_table_bottom_001.png").setDepth(200));
+    const _0x3e9c79 = _0x33b564.y - 35;
+    
+    this._songslayer.add(this.add.bitmapText(containerX, 65, "bigFont", "Soundtrack", 55).setOrigin(0.5, 0.5).setDepth(210));
+    this._songslayer.add(this.add.bitmapText(containerX, 300, "bigFont", "Nothing here yet... Sorry :(", 42).setOrigin(0.5, 0.5).setDepth(210));
+    
+    this._songslayer.add(this.add.image(containerX - 312, _0x3e9c79, "GJ_WebSheet", "chain_01_001.png").setOrigin(0.5, 1).setDepth(210));
+    this._songslayer.add(this.add.image(containerX + 312, _0x3e9c79, "GJ_WebSheet", "chain_01_001.png").setOrigin(0.5, 1).setDepth(210));
+    
+    const closeBtn = this.add.image(containerX - 535, 30, "GJ_GameSheet03", "GJ_arrow_03_001.png").setInteractive().setDepth(210);
+    this._songslayer.add(closeBtn);
+    this._makeBouncyButton(closeBtn, 1, () => this._hideSongsPopup());
+  }
+
+  _hideSongsPopup() {
+    if (this._songsoverlay) {
+      this._songsoverlay.destroy();
+      this._songsoverlay = null;
+    }
+    if (this._songslayer) {
+      this._songslayer.destroy();
+      this._songslayer = null;
+    }
+    this._songpopupclose = false;
+    if (this._pauseBtn) {
+      this.tweens.add({ targets: this._pauseBtn, alpha: 1, duration: 300 });
+    }
+  }
+
+        _redirectRate() {
+window.open("https://github.com/web-dashers/web-dashers.github.io", "_blank"); }
+
   _showSettingsScreen() {
     this._settingsScreenClosing = false;
     if (this._pauseBtn) {
@@ -9062,17 +10643,17 @@ _applyMirrorEffect() {
     _makeSettingsBtn(_sColR, _sRow1Y, "How To Play", _sBtnW2, true, () => { this._buildHowToPlayPopup(); });
     _makeSettingsBtn(_sColL, _sRow2Y, "Options",    _sBtnW2, true,  () => { this._buildSettingsPopup(); });
     _makeSettingsBtn(_sColR, _sRow2Y, "Graphics",   _sBtnW2, false, null);
-    _makeSettingsBtn(_sCol3L, _sRow3Y, "Rate",      _sBtnW3, false, null);
-    _makeSettingsBtn(_sCol3M, _sRow3Y, "Songs",     _sBtnW3, false, null);
-    _makeSettingsBtn(_sCol3R, _sRow3Y, "Help",      _sBtnW3, false, null);
+    _makeSettingsBtn(_sCol3L, _sRow3Y, "Rate",      _sBtnW3, true, () => { this._redirectRate(); });
+    _makeSettingsBtn(_sCol3M, _sRow3Y, "Songs",     _sBtnW3, true, () => { this._hideSettingsScreen(() => this.time.delayedCall(150, () => this._buildsongspopup())); });
+    _makeSettingsBtn(_sCol3R, _sRow3Y, "Help",      _sBtnW3, true, () => { this._hideSettingsScreen(() => this.time.delayedCall(150, () => this._buildhelppopup())); });
 
-    const lockIcon = this.add.image(containerX + 535, 30, "GJ_GameSheet03", "GJ_lock_open_001.png").setFlipX(false).setFlipY(false);
+    const lockIcon = this.add.image(containerX + 535, 30, "GJ_GameSheet03", "GJ_lockGray_001.png").setFlipX(false).setFlipY(false);
     lockIcon.setScale(0.9);
     lockIcon.setInteractive();
     this._expandHitArea(lockIcon, 1.5);
     this._makeBouncyButton(lockIcon, 0.9, () => { this._openVaultMenu(); });
     this._settingsLayerInternal.add(lockIcon);
-    
+
     const _0x45b6e4 = 0.8;
     let _0xe44f6d = 250;
     const sliderStartY = 430;
@@ -9098,8 +10679,12 @@ _applyMirrorEffect() {
             setter(pct < 0.03 ? 0 : pct);
         });
     };
-
     
+    createSlider(sliderStartY - 15, "Music", this._audio.getUserMusicVolume(), v => this._audio.setUserMusicVolume(v));
+    createSlider(sliderStartY + 60, "SFX", this._sfxVolume, v => {
+        this._sfxVolume = v;
+        localStorage.setItem("userSfxVol", v);
+    });
     const checkboxY = sliderStartY - 10;
     const checkboxX = containerX + 280;
     this._settingsLayerInternal.add(this.add.bitmapText(checkboxX, checkboxY - 42, "bigFont", "Menu", 20).setOrigin(0.5, 0.5));
@@ -9112,9 +10697,33 @@ _applyMirrorEffect() {
     const setMenuMusicEnabled = (value) => localStorage.setItem("menuMusicEnabled", value);
     
     const getTex = () => getMenuMusicEnabled() ? "GJ_checkOn_001.png" : "GJ_checkOff_001.png";
-    const check = this.add.image(checkboxX, checkboxY + 15, "GJ_GameSheet03", getTex()).setScale(0.7).setInteractive().setTint(0x666666);
+    const check = this.add.image(checkboxX, checkboxY + 15, "GJ_GameSheet03", getTex()).setScale(0.7).setInteractive();
     this._settingsLayerInternal.add(check);
-    this._makeBouncyButton(check, 0.8, () => {});
+    this._makeBouncyButton(check, 0.8, () => {
+        const newState = !getMenuMusicEnabled();
+        setMenuMusicEnabled(newState);
+        check.setTexture("GJ_GameSheet03", getTex());
+        if (newState) {
+            if (!this._audio.isplaying()) {
+                this._audio.startMenuMusic();
+            }
+        } else {
+            if (this._audio.isplaying()) {
+                this._audio.stopMusic();
+            }
+        }
+    });
+    // Verity menu loop toggle (BPM button sprite)
+    const verityX = containerX - 280;
+    this._settingsLayerInternal.add(this.add.bitmapText(verityX, checkboxY - 42, "bigFont", "Verity", 20).setOrigin(0.5, 0.5));
+    this._settingsLayerInternal.add(this.add.bitmapText(verityX, checkboxY - 22, "bigFont", "Loop", 20).setOrigin(0.5, 0.5));
+    const verityTex = () => window.verityMenuLoop ? "GJ_BPMOnBtn_001.png" : "GJ_BPMOffBtn_001.png";
+    const verityBtn = this.add.image(verityX, checkboxY + 15, "GJ_GameSheet03", verityTex()).setScale(0.65).setInteractive();
+    this._settingsLayerInternal.add(verityBtn);
+    this._makeBouncyButton(verityBtn, 0.65, () => {
+        this._setVerityMenuLoop(!window.verityMenuLoop);
+        verityBtn.setTexture("GJ_GameSheet03", verityTex());
+    });
     const _0x45fc2b = [{
       frame: "GJ_arrow_03_001.png",
       dx: -535,
@@ -9143,7 +10752,7 @@ _applyMirrorEffect() {
       ease: "Bounce.Out"
     });
   }
-  _hideSettingsScreen() {
+  _hideSettingsScreen(closeCallback) {
     if (!this._settingsLayerInternal || this._settingsScreenClosing) {
       return;
     }
@@ -9166,11 +10775,15 @@ _applyMirrorEffect() {
           duration: 300
         });
       }
+
+      if (typeof closeCallback === "function") {
+        closeCallback();
+      }
     };
     this.tweens.add({
       targets: this._settingsLayerOverlay,
       alpha: 0,
-      duration: 500,
+      duration: 250,
       ease: "Linear"
     });
 
@@ -9180,10 +10793,105 @@ _applyMirrorEffect() {
     this.tweens.add({
       targets: _0x59b9ab,
       p: 0,
-      duration: 500,
+      duration: 450,
       ease: "Quad.In",
       onUpdate: () => {
         this._settingsLayerInternal.y = _0x59b9ab.p * 650 - 640;
+      },
+      onComplete: _0x272eb1
+    });
+  }
+  _hideHelpPopup() {
+    if (!this._helplayer || this._helpclose) {
+      return;
+    }
+    this._helpclose = true;
+    const _0x272eb1 = () => {
+      this._helpclose = false;
+      if (this._helpoverlay) {
+        this._helpoverlay.destroy();
+        this._helpoverlay = null;
+      }
+      if (this._helplayer) {
+        this._helplayer.destroy();
+        this._helplayer = null;
+      }
+
+      if (this._pauseBtn) {
+        this.tweens.add({
+          targets: this._pauseBtn,
+          alpha: 1,
+          duration: 300
+        });
+      }
+    };
+    this.tweens.add({
+      targets: this._helpoverlay,
+      alpha: 0,
+      duration: 250,
+      ease: "Linear"
+    });
+
+    const _0x59b9ab = {
+      p: 1
+    };
+    this.tweens.add({
+      targets: _0x59b9ab,
+      p: 0,
+      duration: 450,
+      ease: "Quad.In",
+      onUpdate: () => {
+        this._helplayer.y = _0x59b9ab.p * 650 - 640;
+      },
+      onComplete: _0x272eb1
+    });
+  }
+
+  _hideSongsPopup() {
+    if (!this._songslayer || this._songpopupclose) {
+      return;
+    }
+    this._songpopupclose = true;
+    const _0x272eb1 = () => {
+      this._songpopupclose = false;
+      if (this._songScrollCleanup) {
+        this._songScrollCleanup();
+        this._songScrollCleanup = null;
+      }
+      if (this._songsoverlay) {
+        this._songsoverlay.destroy();
+        this._songsoverlay = null;
+      }
+      if (this._songslayer) {
+        this._songslayer.destroy();
+        this._songslayer = null;
+      }
+
+      if (this._pauseBtn) {
+        this.tweens.add({
+          targets: this._pauseBtn,
+          alpha: 1,
+          duration: 300
+        });
+      }
+    };
+    this.tweens.add({
+      targets: this._songsoverlay,
+      alpha: 0,
+      duration: 250,
+      ease: "Linear"
+    });
+
+    const _0x59b9ab = {
+      p: 1
+    };
+    this.tweens.add({
+      targets: _0x59b9ab,
+      p: 0,
+      duration: 450,
+      ease: "Quad.In",
+      onUpdate: () => {
+        this._songslayer.y = _0x59b9ab.p * 650 - 640;
       },
       onComplete: _0x272eb1
     });
@@ -9237,7 +10945,7 @@ _applyMirrorEffect() {
     const _rowLeft = _0x2a115c + 7.8;
     const _rowRight = _0x2a115c + _0x595215 - 7.8;
     const _rowWidth = _rowRight - _rowLeft;
-    const _rowCount = 6;
+    const _rowCount = 7;
     const _rowH = (_rowPanelBottom - _rowPanelTop) / _rowCount;
 
     const rows = [
@@ -9245,7 +10953,8 @@ _applyMirrorEffect() {
       { label: "Total Attempts:",       value: String(this._attempts || 1) },
       { label: "Completed Levels:",     value: String(window._completedLevels || 0) },
       { label: "Total Deaths:",      value: String(this._totalDeaths || 0) },
-      { label: "???:",   value: String(window._totalDiamonds || '?') },
+      { label: "Total Secret Coins:",   value: String(window._totalsecretcoins || 0) },
+      { label: "Total User Coins:",   value: String(window._totalusercoins || 0) },
       { label: "???:", value: String(window._totalOrbs || '?') },
       
     ];
@@ -9325,7 +11034,10 @@ _applyMirrorEffect() {
     }
     const _0x4edc03 = this._endStarX;
     const _0x5a0e9 = this._endStarY;
-    const _0x453043 = this.add.image(_0x4edc03, _0x5a0e9, "GJ_WebSheet", "GJ_bigStar_001.png").setScale(3).setAlpha(0);
+    const _isPlatMoonAward = !!(this._platLevelRewardMoon || window._platLevelActive);
+    const _rewardFrame = _isPlatMoonAward ? "GJ_bigMoon_noShadow_001.png" : "GJ_bigStar_001.png";
+    // Both reward frames are in GJ_GameSheet03.json; never request them from GJ_WebSheet.
+    const _0x453043 = this.add.image(_0x4edc03, _0x5a0e9, "GJ_GameSheet03", _rewardFrame).setScale(3).setAlpha(0);
     this._endLayerInternal.add(_0x453043);
     this.tweens.add({
       targets: _0x453043,
@@ -9335,8 +11047,8 @@ _applyMirrorEffect() {
       delay: 0,
       ease: "Bounce.Out"
     });
-    this.time.delayedCall(100, () => {
-      this._audio.playEffect("highscoreGet02");
+    this.time.delayedCall(125, () => {
+      this._audio.playEffect("gold02");
       const _0x1204d3 = _0x4edc03;
       const _0x96e3b2 = _0x5a0e9 + this._endLayerInternal.y;
       this.add.particles(_0x1204d3, _0x96e3b2, "GJ_WebSheet", {
@@ -9381,6 +11093,133 @@ _applyMirrorEffect() {
           _0x43203f.fillCircle(_0x1204d3, _0x96e3b2, 20 + _0x403316.t * 200);
         },
         onComplete: () => _0x43203f.destroy()
+      });
+    });
+  }
+  _playsecretcoinanimation() {
+    if (!this._endLayerInternal || !this._endsecretcoinPositions || this._practicedMode.practiceMode) return;
+    this._endcoinAwardTimer = [];
+    const collectedSlot = new Set();
+    if (this._level?._editorEndSecretCoinSlots) {
+      for (const slot of this._level._editorEndSecretCoinSlots) collectedSlot.add(slot);
+    }
+    for (const sprite of this._level?._coinSprites || []) {
+      if (!sprite || sprite._secretCoinSlot === undefined) continue;
+      if (this._level._secretCoinRunCollected?.has(String(sprite._secretCoinId))) {
+        collectedSlot.add(sprite._secretCoinSlot);
+      }
+    }
+
+    [...collectedSlot].sort((a, b) => a - b).forEach((slot, index) => {
+      const position = this._endsecretcoinPositions[slot];
+      if (!position) return;
+      const cointimer = this.time.delayedCall(index * 375, () => {
+        if (!this._endLayerInternal || !this._endLayerInternal.active) return;
+        const coin = this.add.image(position.x, position.y, "GJ_GameSheet03", "secretCoinUI_001.png")
+          .setOrigin(0.5)
+          .setScale(3)
+          .setAlpha(0);
+        this._endLayerInternal.add(coin);
+        this._audio.playEffect("highscoreGet02");
+        this.tweens.add({
+          targets: coin,
+          scale: 1.1,
+          alpha: 1,
+          duration: 300,
+          ease: "Bounce.Out"
+        });
+        const effecttimer = this.time.delayedCall(100, () => {
+          if (!this._endLayerInternal || !this._endLayerInternal.active) return;
+          const effectY = position.y + this._endLayerInternal.y;
+          this.add.particles(position.x, effectY, "GJ_WebSheet", {
+            frame: "square.png",
+            speed: { min: 200, max: 600 },
+            angle: { min: 0, max: 360 },
+            scale: { start: 0.35, end: 0 },
+            alpha: { start: 1, end: 0 },
+            lifespan: { min: 200, max: 600 },
+            quantity: 30,
+            stopAfter: 30,
+            blendMode: S,
+            tint: 0xd0d0d0
+          }).setScrollFactor(0).setDepth(202);
+
+          const glow = this.add.graphics().setScrollFactor(0).setDepth(202).setBlendMode(S);
+          const glowState = { progress: 0 };
+          this.tweens.add({
+            targets: glowState,
+            progress: 1,
+            duration: 400,
+            ease: "Quad.Out",
+            onUpdate: () => {
+              glow.clear();
+              glow.fillStyle(0xd0d0d0, 1 - glowState.progress);
+              glow.fillCircle(position.x, effectY, 12 + glowState.progress * 130);
+            },
+            onComplete: () => glow.destroy()
+          });
+        });
+        this._endcoinAwardTimer.push(effecttimer);
+      });
+      this._endcoinAwardTimer.push(cointimer);
+    });
+  }
+  _playusercoinanimation() {
+    if (!this._endLayerInternal || !this._endusercoinPosition) return;
+    this._endcoinAwardTimer = [];
+    const collectedSlot = new Set();
+    if (this._level?._editorEndUserCoinSlots) {
+      for (const slot of this._level._editorEndUserCoinSlots) collectedSlot.add(slot);
+    }
+    for (const sprite of this._level?._coinSprites || []) {
+      if (sprite?._userCoinSlot === undefined) continue;
+      if (this._level._userCoinRunCollected?.has(String(sprite._userCoinId))) {
+        collectedSlot.add(sprite._userCoinSlot);
+      }
+    }
+
+    [...collectedSlot].sort((a, b) => a - b).forEach((slot, index) => {
+      const position = this._endusercoinPosition[slot];
+      if (!position) return;
+      const cointimer = this.time.delayedCall(index * 375, () => {
+        if (!this._endLayerInternal || !this._endLayerInternal.active) return;
+        const coin = this.add.image(position.x, position.y, "GJ_GameSheet03", "secretCoinUI2_001.png")
+          .setOrigin(0.5).setScale(3).setAlpha(0);
+        this._endLayerInternal.add(coin);
+        this._audio.playEffect("highscoreGet02");
+        this.tweens.add({ targets: coin, scale: 1.1, alpha: 1, duration: 300, ease: "Bounce.Out" });
+        const effecttimer = this.time.delayedCall(100, () => {
+          if (!this._endLayerInternal || !this._endLayerInternal.active) return;
+          const effectY = position.y + this._endLayerInternal.y;
+          this.add.particles(position.x, effectY, "GJ_WebSheet", {
+            frame: "square.png",
+            speed: { min: 200, max: 600 },
+            angle: { min: 0, max: 360 },
+            scale: { start: 0.35, end: 0 },
+            alpha: { start: 1, end: 0 },
+            lifespan: { min: 200, max: 600 },
+            quantity: 30,
+            stopAfter: 30,
+            blendMode: S,
+            tint: 0xd0d0d0
+          }).setScrollFactor(0).setDepth(202);
+          const glow = this.add.graphics().setScrollFactor(0).setDepth(202).setBlendMode(S);
+          const glowState = { progress: 0 };
+          this.tweens.add({
+            targets: glowState,
+            progress: 1,
+            duration: 400,
+            ease: "Quad.Out",
+            onUpdate: () => {
+              glow.clear();
+              glow.fillStyle(0xd0d0d0, 1 - glowState.progress);
+              glow.fillCircle(position.x, effectY, 12 + glowState.progress * 130);
+            },
+            onComplete: () => glow.destroy()
+          });
+          this._endcoinAwardTimer.push(effecttimer);
+        });
+        this._endcoinAwardTimer.push(cointimer);
       });
     });
   }
@@ -10846,6 +12685,12 @@ _applyMirrorEffect() {
   }
 
   _hideEndLayer(_0x272eb1) {
+    if (this._endcoinAwardTimer) {
+      for (const timer of this._endcoinAwardTimer) {
+        timer?.remove?.(false);
+      }
+      this._endcoinAwardTimer = null;
+    }
     if (!this._endLayerInternal) {
       if (_0x272eb1) {
         _0x272eb1();
