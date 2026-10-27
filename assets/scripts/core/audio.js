@@ -57,17 +57,11 @@ window.SongDB = {
 };
 window.SongDB.init().catch(console.warn);
 
-// ---------------------------------------------------------------------
-// Every volume in this file is intentionally hardcoded to a single loud
-// constant. Change LOUD_VOLUME below to tune how loud "loud" is.
-// ---------------------------------------------------------------------
-const LOUD_VOLUME = 100;
-
 class AudioManager {
   constructor(scene) {
     this._scene = scene;
     this._music = null;
-    this._userMusicVol = LOUD_VOLUME;
+    this._userMusicVol = localStorage.getItem("userMusicVol") ?? 1;
     this._meteringEnabled = false;
     this._analyser = null;
     this._meterBuffer = null;
@@ -84,7 +78,7 @@ class AudioManager {
     this._pendingOnlineSongFadeDuration = null;
   }
   _effectiveVolume() {
-    return LOUD_VOLUME;
+    return this._userMusicVol * 0.8;
   }
   get musicPlaying() {
     return !!this._pendingMusicLoadKey || !!this._pendingOnlineSongLoadKey || this.isplaying();
@@ -95,7 +89,7 @@ class AudioManager {
     return Number.isFinite(parsedOffset) ? parsedOffset : 0;
   }
   _shouldUsePracticeSong() {
-    return !!(this._scene?._practicedMode?.practiceMode && !window.practiceMusicBypass);
+    return !!(this._scene?._practicedMode?.practiceMode && !window.practiceMusicSync);
   }
   _getOfficialSongAudioPath(songKey = window.currentlevel?.[0]) {
     if (!songKey || !Array.isArray(window.allLevels)) return null;
@@ -215,10 +209,10 @@ class AudioManager {
 
         const songTitle = (ngMap["2"] || `Song #${songId}`).replace(/:$/, "").trim();
         const songArtist = (ngMap["4"] || "Unknown").replace(/:$/, "").trim();
-
+        
         const arrayBuf = await window.SongDB.load(songId);
         if (!arrayBuf) throw new Error("Song not downloaded manually");
-
+        
         const decoded = await ctx.decodeAudioData(arrayBuf.slice(0));
 
         if (this._pendingOnlineSongLoadKey !== songKey) return;
@@ -261,7 +255,7 @@ class AudioManager {
     if (this._music && this._music.isPlaying) {
       savedPosition = this._music.seek || 0;
       savedKey = this._music.key;
-    }
+    }  
     if (this._music) {
       this._music.stop();
       this._music.destroy();
@@ -271,7 +265,7 @@ class AudioManager {
       if (this._scene.cache.audio.exists(practiceSongKey)) {
         this._music = this._scene.sound.add(practiceSongKey, {
           loop: true,
-          volume: LOUD_VOLUME
+          volume: this._effectiveVolume()
         });
         this._music.play();
         if (savedKey === practiceSongKey && savedPosition > 0) {
@@ -303,8 +297,8 @@ class AudioManager {
       return;
     }
     this._music = this._scene.sound.add(_songKey, {
-      loop: true,
-      volume: LOUD_VOLUME
+      loop: false,
+      volume: this._effectiveVolume()
     });
     this._music.play();
     const startOffset = this._getLevelSongStartOffset();
@@ -323,7 +317,7 @@ class AudioManager {
     }
     if (ctx.state === 'suspended') { ctx.resume(); }
     const gainNode = ctx.createGain();
-    gainNode.gain.value = LOUD_VOLUME;
+    gainNode.gain.value = this._effectiveVolume();
     const dest = soundMgr.masterVolumeNode || soundMgr.destination || ctx.destination;
     gainNode.connect(dest);
     const safeOffset = Math.max(0, Math.min(startOffset, audioBuffer.duration - 0.01));
@@ -377,8 +371,8 @@ class AudioManager {
         _isPaused   = false;
       },
       setLoop: () => {},
-      get volume() { return LOUD_VOLUME; },
-      set volume(v) { gainNode.gain.value = LOUD_VOLUME; }
+      get volume() { return gainNode.gain.value; },
+      set volume(v) { gainNode.gain.value = v; }
     };
 
     this._music = musicObj;
@@ -390,7 +384,7 @@ class AudioManager {
     }
     this._music = this._scene.sound.add("menu_music", {
       loop: true,
-      volume: LOUD_VOLUME
+      volume: this._effectiveVolume()
     });
     this._music.play();
     this._setupAnalyser();
@@ -416,21 +410,20 @@ class AudioManager {
     }
   }
   getUserMusicVolume() {
-    return LOUD_VOLUME;
+    return this._userMusicVol;
   }
   setUserMusicVolume(newVolume) {
-    // Input is ignored on purpose — volume is hardcoded loud everywhere.
-    this._userMusicVol = LOUD_VOLUME;
-    localStorage.setItem("userMusicVol", LOUD_VOLUME);
+    this._userMusicVol = newVolume;
+    localStorage.setItem("userMusicVol", newVolume);
     if (this._music) {
-      this._music.volume = LOUD_VOLUME;
+      this._music.volume = this._effectiveVolume();
     }
   }
   getMusicVolume() {
-    return LOUD_VOLUME;
+    return this._effectiveVolume();
   }
   setMusicVolume(newVolume) {
-    this.setUserMusicVolume(LOUD_VOLUME);
+    this.setUserMusicVolume(newVolume / 0.8);
   }
   fadeInMusic(durationMillis = 1000) {
     if (this._music) {
@@ -442,7 +435,7 @@ class AudioManager {
       if (this._scene.cache.audio.exists(practiceSongKey)) {
         this._music = this._scene.sound.add(practiceSongKey, {
           loop: true,
-          volume: LOUD_VOLUME
+          volume: 0
         });
         this._music.play();
         this._setupAnalyser();
@@ -450,12 +443,12 @@ class AudioManager {
         return;
       }
     }
-
+    
     if (window._onlineSongBuffer && window._onlineSongKey === window.currentlevel?.[0]) {
       const startOffset = window._onlineSongOffset || 0;
       this._playOnlineBuffer(window._onlineSongBuffer, startOffset);
       if (this._onlineGain) {
-        this._onlineGain.gain.value = LOUD_VOLUME;
+        this._onlineGain.gain.value = this._effectiveVolume();
       }
       this._setupAnalyser();
       this._musicPlaying = true;
@@ -479,12 +472,15 @@ class AudioManager {
 
     this._music = this._scene.sound.add(songKey, {
       loop: true,
-      volume: LOUD_VOLUME
+      volume: 0
     });
     this._music.play();
     this._setupAnalyser();
-    // No fade-in ramp anymore — jump straight to full loud volume.
-    this._music.volume = LOUD_VOLUME;
+    this._scene.tweens.add({
+      targets: this._music,
+      volume: this._effectiveVolume(),
+      duration: durationMillis
+    });
     this._musicPlaying = true;
   }
   fadeOutMusic(durationMillis = 1500) {
@@ -505,8 +501,14 @@ class AudioManager {
   playEffect(soundEffect, volumeObj = {}) {
     if (this._scene.sound.context && this._scene.cache.audio.exists(soundEffect)) {
       const soundObject = this._scene.sound.add(soundEffect);
+      const rawBaseVolume = volumeObj && Object.prototype.hasOwnProperty.call(volumeObj, "volume")
+        ? Number(volumeObj.volume)
+        : 1;
+      const rawSfxVolume = Number(this._scene?._sfxVolume ?? localStorage.getItem("userSfxVol") ?? 1);
+      const baseVolume = Number.isFinite(rawBaseVolume) ? rawBaseVolume : 1;
+      const sfxVolume = Number.isFinite(rawSfxVolume) ? rawSfxVolume : 1;
       soundObject.play({
-        volume: LOUD_VOLUME
+        volume: Math.max(0, baseVolume * sfxVolume)
       });
     }
   }
@@ -521,7 +523,7 @@ class AudioManager {
     }
   }
   _ensureCorrectMusicMode() {
-    if (this._scene?._practiceMusicBypassChangePendingUntilRestart) return;
+    if (this._scene?._practiceMusicSyncChangePendingUntilRestart) return;
     if (this._pendingMusicLoadKey || this._pendingOnlineSongLoadKey) return;
     if (!this._music) return;
     const expectedSongKey = this._shouldUsePracticeSong() ? "StayInsideMe" : window.currentlevel?.[0];
@@ -545,7 +547,7 @@ class AudioManager {
         biggestBuf = buf;
       }
     }
-    const volume = LOUD_VOLUME;
+    const volume = this._effectiveVolume();
     if (volume > 0) {
       biggestBuf /= volume;
     }
@@ -569,7 +571,7 @@ class AudioManager {
   }
   reset() {
     this._meterValue = 0.1;
-    this._lastAudio = LOUD_VOLUME;
+    this._lastAudio = 0.1;
     this._lastPeak = 0;
     this._silenceCounter = 0;
     this._pendingMusicLoadKey = null;
