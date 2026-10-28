@@ -6,4 +6,3 @@ window.allLevels = [
 	    ["RobTop", "Forever Bound"]   // person who made the level, person who made the song
 	    ["rohanis0000", "Forever Bound"]
     ]
-	*/
